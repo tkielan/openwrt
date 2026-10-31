@@ -286,6 +286,7 @@ platform_do_upgrade() {
 		fi
 		nand_do_upgrade_success
 		;;
+	tplink,archer-ax55-pro-v1|\
 	tplink,archer-ax55-v1|\
 	tplink,eap650-outdoor-v1|\
 	tplink,re700x)

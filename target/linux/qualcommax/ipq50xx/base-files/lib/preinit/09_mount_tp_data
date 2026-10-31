@@ -1,6 +1,6 @@
 #!/bin/sh
 # TP-Link/Mercusys boards keep their factory data (including the 6-byte
-# "default-mac") in the tp_data UBIFS volume. Attach and mount it read-only
+# "default-mac" and "product-info") in the tp_data UBIFS volume. Attach and mount it read-only
 # during preinit so board.d/02_network and the ath11k caldata hotplug can
 # read the MAC without each attaching the volume themselves.
 
@@ -8,7 +8,9 @@
 
 preinit_mount_tp_data() {
 	case "$(board_name)" in
-	mercusys,mr80x-v2|tplink,archer-ax55-v1) ;;
+	mercusys,mr80x-v2|\
+	tplink,archer-ax55-pro-v1|\
+	tplink,archer-ax55-v1) ;;
 	*) return ;;
 	esac
 
@@ -17,14 +19,23 @@ preinit_mount_tp_data() {
 	local mtd_num ubi_num
 
 	mtd_num=$(find_mtd_index tp_data)
-	[ -n "$mtd_num" ] || return
+	[ -n "$mtd_num" ] || {
+		echo "tp_data: factory partition not found" >&2
+		return 1
+	}
 
 	ubi_num=$(ubiattach -m "$mtd_num" 2>/dev/null | \
 		sed -n 's/.*device number \([0-9]*\).*/\1/p')
-	[ -n "$ubi_num" ] || return
+	[ -n "$ubi_num" ] || {
+		echo "tp_data: failed to attach factory partition mtd$mtd_num" >&2
+		return 1
+	}
 
-	mkdir -p /tmp/tp_data
-	mount -t ubifs -o ro "ubi${ubi_num}:tp_data" /tmp/tp_data 2>/dev/null
+	mkdir -p /tmp/tp_data || return 1
+	mount -t ubifs -o ro "ubi${ubi_num}:tp_data" /tmp/tp_data || {
+		echo "tp_data: failed to mount factory volume read-only" >&2
+		return 1
+	}
 }
 
 boot_hook_add preinit_main preinit_mount_tp_data

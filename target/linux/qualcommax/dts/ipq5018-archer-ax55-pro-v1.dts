@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+
+/dts-v1/;
+
+#include "ipq5018-archer-ax55-common.dtsi"
+#include "ipq5018-ess.dtsi"
+
+/ {
+	model = "TP-Link Archer AX55 Pro v1";
+	compatible = "tplink,archer-ax55-pro-v1", "qcom,ipq5018";
+};
+
+/*
+ * Serial/USB bring-up only. Leave Ethernet and Wi-Fi disabled until the
+ * family-D switch/RTL8221B wiring, regional board-data selection and
+ * radio MAC handling are verified. ART extraction offsets are known.
+ */
+&gmac0 {
+	status = "disabled";
+};
+
+&gmac1 {
+	status = "disabled";
+};
+
+&q6v5_wcss {
+	status = "disabled";
+};
+
+&wifi {
+	status = "disabled";
+};

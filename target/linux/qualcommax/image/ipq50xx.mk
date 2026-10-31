@@ -359,6 +359,29 @@ endif
 endef
 TARGET_DEVICES += tplink_archer-ax55-v1
 
+define Device/tplink_archer-ax55-pro-v1
+	$(call Device/FitImageLzma)
+	DEVICE_VENDOR := TP-Link
+	DEVICE_MODEL := Archer AX55 Pro
+	DEVICE_VARIANT := v1 (experimental, serial/USB only)
+	DEVICE_DTS_CONFIG := config@mp03.3
+	SOC := ipq5018
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	IMAGE_SIZE := 43008k
+	NAND_SIZE := 128m
+	KERNEL_IN_UBI := 1
+	BROKEN := y
+	DEVICE_PACKAGES := -kmod-ath11k-ahb -wpad-basic-mbedtls \
+		kmod-usb-ledtrig-usbport
+	DEVICE_DESCRIPTION := Experimental serial/USB bring-up only; Ethernet and Wi-Fi are disabled. \
+		Requires serial access and a verified recovery method. \
+		ART extraction is wired; family-D switch/RTL8221B wiring, regional board-data \
+		selection and radio MAC handling remain unresolved. \
+		No OEM factory installation image is provided.
+endef
+TARGET_DEVICES += tplink_archer-ax55-pro-v1
+
 define Device/tplink_eap650-outdoor-v1
 	$(call Device/FitImage)
 	$(call Device/UbiFit)
