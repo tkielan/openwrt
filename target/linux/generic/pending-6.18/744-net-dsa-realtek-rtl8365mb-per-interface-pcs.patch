@@ -1,0 +1,278 @@
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: allocate PCS per external interface
+
+Give each SerDes-capable external interface its own PCS instance and
+select it using the port mapping, rather than returning one shared PCS.
+Keep existing family-C register programming and supported modes unchanged.
+
+Serialize complete SerDes indirect transactions under the regmap lock,
+using the unlocked map inside the transaction. This prevents another PCS
+poll or configuration request from replacing the address or command.
+
+This is preparation for dual-SerDes switches, not RTL8367D enablement.
+Family-D identification and forwarding/register support remain separate.
+
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -299,16 +299,6 @@
+ #define RTL8365MB_SDS_REG_LINK_STATUS		0x003d
+ #define   RTL8365MB_SDS_LINK_STATUS_LINK_MASK	BIT(4)
+ 
+-/* The embedded SerDes can only be muxed to external interface 1 (MAC8),
+- * which is port 6.
+- */
+-#define RTL8365MB_SDS_EXT_INTERFACE_ID		1
+-#define RTL8365MB_SDS_EXT_INTERFACE_PORT	6
+-
+-/* Line rate bypass bit for the SerDes external interface */
+-#define RTL8365MB_SDS_BYPASS_LINE_RATE_MASK \
+-	RTL8365MB_BYPASS_LINE_RATE_MASK(RTL8365MB_SDS_EXT_INTERFACE_PORT)
+-
+ /* SerDes tuning parameter variant selector. The vendor driver picks between
+  * two sets of SerDes tuning parameters based on this chip option. Reading it
+  * requires first arming the read by writing a magic key to the arm register,
+@@ -689,6 +679,12 @@
+ 	unsigned int supported_interfaces;
+ };
+ 
++struct rtl8365mb_pcs {
++	struct phylink_pcs pcs;
++	struct realtek_priv *priv;
++	const struct rtl8365mb_extint *extint;
++};
++
+ /**
+  * struct rtl8365mb_chip_info - static chip-specific info
+  * @name: human-readable chip name
+@@ -842,7 +838,7 @@
+  * @cpu: CPU tagging and CPU port configuration for this chip
+  * @mib_lock: prevent concurrent reads of MIB counters
+  * @ports: per-port data
+- * @pcs: PCS for the SerDes external interface
++ * @pcs: PCS instances indexed by external interface ID
+  * @sds_supported: SerDes tuning parameters match the chip option, so the
+  *                 SerDes interface modes can be advertised
+  *
+@@ -855,11 +851,12 @@
+ 	struct rtl8365mb_cpu cpu;
+ 	struct mutex mib_lock;
+ 	struct rtl8365mb_port ports[RTL8365MB_MAX_NUM_PORTS];
+-	struct phylink_pcs pcs;
++	struct rtl8365mb_pcs pcs[RTL8365MB_MAX_NUM_EXTINTS];
+ 	bool sds_supported;
+ };
+ 
+-#define pcs_to_rtl8365mb(_pcs) container_of((_pcs), struct rtl8365mb, pcs)
++#define pcs_to_rtl8365mb_pcs(_pcs) \
++	container_of((_pcs), struct rtl8365mb_pcs, pcs)
+ 
+ static int rtl8365mb_phy_poll_busy(struct realtek_priv *priv)
+ {
+@@ -1165,21 +1162,29 @@
+ {
+ 	int ret;
+ 
+-	ret = regmap_write(priv->map, RTL8365MB_SDS_INDACS_DATA_REG, data);
++	rtl83xx_lock(priv);
++
++	ret = regmap_write(priv->map_nolock, RTL8365MB_SDS_INDACS_DATA_REG,
++			   data);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+-	ret = regmap_write(priv->map, RTL8365MB_SDS_INDACS_ADR_REG, addr);
++	ret = regmap_write(priv->map_nolock, RTL8365MB_SDS_INDACS_ADR_REG,
++			   addr);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	/* The SerDes indirect access engine completes the command within the
+ 	 * register write transaction, so there is no need to wait or poll for
+ 	 * completion before the next access, matching the vendor driver.
+ 	 */
+-	return regmap_write(priv->map, RTL8365MB_SDS_INDACS_CMD_REG,
+-			    RTL8365MB_SDS_INDACS_CMD_RUN_MASK |
+-			    RTL8365MB_SDS_INDACS_CMD_WR_MASK);
++	ret = regmap_write(priv->map_nolock, RTL8365MB_SDS_INDACS_CMD_REG,
++			   RTL8365MB_SDS_INDACS_CMD_RUN_MASK |
++			   RTL8365MB_SDS_INDACS_CMD_WR_MASK);
++out:
++	rtl83xx_unlock(priv);
++
++	return ret;
+ }
+ 
+ static int rtl8365mb_sds_read(struct realtek_priv *priv, u16 addr, u16 *data)
+@@ -1187,32 +1192,38 @@
+ 	u32 val;
+ 	int ret;
+ 
+-	ret = regmap_write(priv->map, RTL8365MB_SDS_INDACS_ADR_REG, addr);
++	rtl83xx_lock(priv);
++
++	ret = regmap_write(priv->map_nolock, RTL8365MB_SDS_INDACS_ADR_REG,
++			   addr);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+-	ret = regmap_write(priv->map, RTL8365MB_SDS_INDACS_CMD_REG,
++	ret = regmap_write(priv->map_nolock, RTL8365MB_SDS_INDACS_CMD_REG,
+ 			   RTL8365MB_SDS_INDACS_CMD_RUN_MASK);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	/* Wait for the indirect read to complete: the engine clears the BUSY
+ 	 * bit once the data register holds the result.
+ 	 */
+-	ret = regmap_read_poll_timeout(priv->map, RTL8365MB_SDS_INDACS_CMD_REG,
+-				       val,
++	ret = regmap_read_poll_timeout(priv->map_nolock,
++				       RTL8365MB_SDS_INDACS_CMD_REG, val,
+ 				       !(val & RTL8365MB_SDS_INDACS_CMD_BUSY_MASK),
+ 				       10, 1000);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+-	ret = regmap_read(priv->map, RTL8365MB_SDS_INDACS_DATA_REG, &val);
++	ret = regmap_read(priv->map_nolock, RTL8365MB_SDS_INDACS_DATA_REG,
++			  &val);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	*data = val;
++out:
++	rtl83xx_unlock(priv);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ /* The vendor driver selects between two sets of SerDes tuning parameters based
+@@ -1311,17 +1322,15 @@
+ 				bool permit_pause_to_mac)
+ {
+ 	const struct rtl8365mb_jam_tbl_entry *sds_jam;
+-	const int id = RTL8365MB_SDS_EXT_INTERFACE_ID;
+-	struct rtl8365mb *mb = pcs_to_rtl8365mb(pcs);
+-	struct realtek_priv *priv;
++	struct rtl8365mb_pcs *spcs = pcs_to_rtl8365mb_pcs(pcs);
++	struct realtek_priv *priv = spcs->priv;
++	const int id = spcs->extint->id;
+ 	size_t sds_jam_size;
+ 	u32 mode;
+ 	u16 val;
+ 	int ret;
+ 	int i;
+ 
+-	priv = mb->priv;
+-
+ 	if (interface == PHY_INTERFACE_MODE_2500BASEX) {
+ 		sds_jam = rtl8365mb_sds_jam_hsgmii;
+ 		sds_jam_size = ARRAY_SIZE(rtl8365mb_sds_jam_hsgmii);
+@@ -1354,7 +1363,8 @@
+ 	 * modes except TMII.
+ 	 */
+ 	ret = regmap_update_bits(priv->map, RTL8365MB_BYPASS_LINE_RATE_REG,
+-				 RTL8365MB_SDS_BYPASS_LINE_RATE_MASK, 0);
++				 RTL8365MB_BYPASS_LINE_RATE_MASK(spcs->extint->port),
++				 0);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1440,8 +1450,8 @@
+ 				    unsigned int neg_mode,
+ 				    struct phylink_link_state *state)
+ {
+-	struct rtl8365mb *mb = pcs_to_rtl8365mb(pcs);
+-	struct realtek_priv *priv = mb->priv;
++	struct rtl8365mb_pcs *spcs = pcs_to_rtl8365mb_pcs(pcs);
++	struct realtek_priv *priv = spcs->priv;
+ 	u16 status;
+ 	u32 val;
+ 	int ret;
+@@ -1496,8 +1506,8 @@
+ 				  phy_interface_t interface, int speed,
+ 				  int duplex)
+ {
+-	struct rtl8365mb *mb = pcs_to_rtl8365mb(pcs);
+-	struct realtek_priv *priv = mb->priv;
++	struct rtl8365mb_pcs *spcs = pcs_to_rtl8365mb_pcs(pcs);
++	struct realtek_priv *priv = spcs->priv;
+ 	u32 mask = RTL8365MB_SDS_MISC_SGMII_FDUP_MASK |
+ 		   RTL8365MB_SDS_MISC_SGMII_LINK_MASK |
+ 		   RTL8365MB_SDS_MISC_SGMII_SPD_MASK;
+@@ -1672,9 +1682,16 @@
+ 	struct dsa_port *dp = dsa_phylink_to_port(config);
+ 	struct realtek_priv *priv = dp->ds->priv;
+ 	struct rtl8365mb *mb = priv->chip_data;
++	const struct rtl8365mb_extint *extint;
+ 
+-	if (rtl8365mb_interface_is_serdes(interface))
+-		return &mb->pcs;
++	extint = rtl8365mb_get_port_extint(priv, dp->index);
++	if (extint && mb->sds_supported &&
++	    rtl8365mb_interface_is_serdes(interface) &&
++	    (extint->supported_interfaces &
++	     (interface == PHY_INTERFACE_MODE_SGMII ?
++	      RTL8365MB_PHY_INTERFACE_MODE_SGMII :
++	      RTL8365MB_PHY_INTERFACE_MODE_HSGMII)))
++		return &mb->pcs[extint->id].pcs;
+ 
+ 	return NULL;
+ }
+@@ -2996,6 +3013,32 @@
+ 					20000, 1e6);
+ }
+ 
++static void rtl8365mb_pcs_init(struct realtek_priv *priv)
++{
++	struct rtl8365mb *mb = priv->chip_data;
++	int i;
++
++	/* The SerDes has no link interrupt wired up, so phylink must poll the
++	 * PCS for link changes when it tracks the link through pcs_get_state()
++	 * (in-band mode with autonegotiation disabled).
++	 */
++	for (i = 0; i < RTL8365MB_MAX_NUM_EXTINTS; i++) {
++		const struct rtl8365mb_extint *extint = &mb->chip_info->extints[i];
++		struct rtl8365mb_pcs *spcs;
++
++		if (!(extint->supported_interfaces &
++		      (RTL8365MB_PHY_INTERFACE_MODE_SGMII |
++		       RTL8365MB_PHY_INTERFACE_MODE_HSGMII)))
++			continue;
++
++		spcs = &mb->pcs[extint->id];
++		spcs->priv = priv;
++		spcs->extint = extint;
++		spcs->pcs.ops = &rtl8365mb_pcs_ops;
++		spcs->pcs.poll = true;
++	}
++}
++
+ static int rtl8365mb_setup(struct dsa_switch *ds)
+ {
+ 	struct realtek_priv *priv = ds->priv;
+@@ -3009,13 +3052,7 @@
+ 	mb = priv->chip_data;
+ 	cpu = &mb->cpu;
+ 
+-	mb->pcs.ops = &rtl8365mb_pcs_ops;
+-
+-	/* The SerDes has no link interrupt wired up, so phylink must poll the
+-	 * PCS for link changes when it tracks the link through pcs_get_state()
+-	 * (in-band mode with autonegotiation disabled).
+-	 */
+-	mb->pcs.poll = true;
++	rtl8365mb_pcs_init(priv);
+ 
+ 	ret = rtl8365mb_reset_chip(priv);
+ 	if (ret) {
