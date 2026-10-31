@@ -1,0 +1,231 @@
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: separate external MAC force layouts
+
+Select the external MAC force register layout from the chip information.
+Keep all currently supported chips on the family-C layout, preserving
+their register addresses, force-enable bit and HSGMII speed encoding.
+
+Add the family-D MAC force primitive for external ports 6 and 7. Family D
+uses an ability register at 0x12c0 + port and a separate per-field enable
+register at 0x12c8 + port. Its 2.5 Gbps speed value is 5, split between
+bits 1:0 and 13:12. These encodings and the ability-before-enable write
+order were checked against the running AX55 Pro stock switch module.
+
+Hold the regmap lock across both family-D writes and return the first
+register error. A link-down request forces a zero ability word rather
+than releasing control of the MAC back to hardware autonegotiation.
+
+This does not register family-D chips. Initialization, SerDes programming,
+CPU tagging and forwarding support are still required before enabling
+Ethernet on the AX55 Pro.
+
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -325,11 +325,6 @@
+ #define RTL8365MB_DIGITAL_INTERFACE_FORCE_REG0		0x1310 /* EXT0 */
+ #define RTL8365MB_DIGITAL_INTERFACE_FORCE_REG1		0x1311 /* EXT1 */
+ #define RTL8365MB_DIGITAL_INTERFACE_FORCE_REG2		0x13C4 /* EXT2 */
+-#define RTL8365MB_DIGITAL_INTERFACE_FORCE_REG(_extint) \
+-		((_extint) == 0 ? RTL8365MB_DIGITAL_INTERFACE_FORCE_REG0 : \
+-		 (_extint) == 1 ? RTL8365MB_DIGITAL_INTERFACE_FORCE_REG1 : \
+-		 (_extint) == 2 ? RTL8365MB_DIGITAL_INTERFACE_FORCE_REG2 : \
+-		 0x0)
+ #define   RTL8365MB_DIGITAL_INTERFACE_FORCE_EN_MASK		BIT(12)
+ #define   RTL8365MB_DIGITAL_INTERFACE_FORCE_NWAY_MASK		BIT(7)
+ #define   RTL8365MB_DIGITAL_INTERFACE_FORCE_TXPAUSE_MASK	BIT(6)
+@@ -338,6 +333,13 @@
+ #define   RTL8365MB_DIGITAL_INTERFACE_FORCE_DUPLEX_MASK		BIT(2)
+ #define   RTL8365MB_DIGITAL_INTERFACE_FORCE_SPEED_MASK		GENMASK(1, 0)
+ 
++/* Family D separates the ability word from its per-field force enables. */
++#define RTL8367D_MAC_FORCE_REG(_port)		(0x12C0 + (_port))
++#define RTL8367D_MAC_FORCE_EN_REG(_port)		(0x12C8 + (_port))
++#define RTL8367D_MAC_FORCE_EN_ALL			0xFFFF
++#define RTL8367D_MAC_FORCE_SPEED_HIGH_MASK	GENMASK(13, 12)
++#define RTL8367D_PORT_SPEED_2500M			5
++
+ /* CPU port mask register - controls which ports are treated as CPU ports */
+ #define RTL8365MB_CPU_PORT_MASK_REG	0x1219
+ #define   RTL8365MB_CPU_PORT_MASK_MASK	RTL8365MB_PORT_MASK
+@@ -685,12 +687,18 @@
+ 	const struct rtl8365mb_extint *extint;
+ };
+ 
++enum rtl8365mb_mac_force_layout {
++	RTL8365MB_MAC_FORCE_C,
++	RTL8365MB_MAC_FORCE_D,
++};
++
+ /**
+  * struct rtl8365mb_chip_info - static chip-specific info
+  * @name: human-readable chip name
+  * @chip_id: chip identifier
+  * @chip_ver: chip silicon revision
+  * @extints: available external interfaces
++ * @mac_force_layout: external MAC force register layout
+  * @jam_table: chip-specific initialization jam table
+  * @jam_size: size of the chip's jam table
+  *
+@@ -703,6 +711,7 @@
+ 	u32 chip_id;
+ 	u32 chip_ver;
+ 	const struct rtl8365mb_extint extints[RTL8365MB_MAX_NUM_EXTINTS];
++	enum rtl8365mb_mac_force_layout mac_force_layout;
+ 	const struct rtl8365mb_jam_tbl_entry *jam_table;
+ 	size_t jam_size;
+ };
+@@ -712,6 +721,7 @@
+ static const struct rtl8365mb_chip_info rtl8365mb_chip_infos[] = {
+ 	{
+ 		.name = "RTL8365MB-VC",
++		.mac_force_layout = RTL8365MB_MAC_FORCE_C,
+ 		.chip_id = 0x6367,
+ 		.chip_ver = 0x0040,
+ 		.extints = {
+@@ -723,6 +733,7 @@
+ 	},
+ 	{
+ 		.name = "RTL8367S",
++		.mac_force_layout = RTL8365MB_MAC_FORCE_C,
+ 		.chip_id = 0x6367,
+ 		.chip_ver = 0x00A0,
+ 		.extints = {
+@@ -735,6 +746,7 @@
+ 	},
+ 	{
+ 		.name = "RTL8367SB",
++		.mac_force_layout = RTL8365MB_MAC_FORCE_C,
+ 		.chip_id = 0x6367,
+ 		.chip_ver = 0x0010,
+ 		.extints = {
+@@ -749,6 +761,7 @@
+ 	},
+ 	{
+ 		.name = "RTL8367RB-VB",
++		.mac_force_layout = RTL8365MB_MAC_FORCE_C,
+ 		.chip_id = 0x6367,
+ 		.chip_ver = 0x0020,
+ 		.extints = {
+@@ -1556,19 +1569,66 @@
+ 	.pcs_link_up = rtl8365mb_pcs_link_up,
+ };
+ 
++static int rtl8365mb_ext_write_force(struct realtek_priv *priv,
++				     const struct rtl8365mb_extint *extint,
++				     u32 ability, u32 speed)
++{
++	static const u16 force_regs[RTL8365MB_MAX_NUM_EXTINTS] = {
++		RTL8365MB_DIGITAL_INTERFACE_FORCE_REG0,
++		RTL8365MB_DIGITAL_INTERFACE_FORCE_REG1,
++		RTL8365MB_DIGITAL_INTERFACE_FORCE_REG2,
++	};
++	struct rtl8365mb *mb = priv->chip_data;
++	int ret;
++
++	if (extint->id < 0 || extint->id >= RTL8365MB_MAX_NUM_EXTINTS) {
++		dev_err(priv->dev, "invalid external interface %d\n", extint->id);
++		return -EINVAL;
++	}
++
++	switch (mb->chip_info->mac_force_layout) {
++	case RTL8365MB_MAC_FORCE_C:
++		return regmap_write(priv->map, force_regs[extint->id],
++				    ability |
++				    RTL8365MB_DIGITAL_INTERFACE_FORCE_EN_MASK);
++	case RTL8365MB_MAC_FORCE_D:
++		if (!extint->id || extint->port != 5 + extint->id) {
++			dev_err(priv->dev, "invalid family-D external port %d\n",
++				extint->port);
++			return -EINVAL;
++		}
++
++		ability |= FIELD_PREP(RTL8367D_MAC_FORCE_SPEED_HIGH_MASK,
++				      speed >> 2);
++		rtl83xx_lock(priv);
++		ret = regmap_write(priv->map_nolock,
++				   RTL8367D_MAC_FORCE_REG(extint->port), ability);
++		if (!ret)
++			ret = regmap_write(priv->map_nolock,
++					   RTL8367D_MAC_FORCE_EN_REG(extint->port),
++					   RTL8367D_MAC_FORCE_EN_ALL);
++		rtl83xx_unlock(priv);
++		return ret;
++	default:
++		dev_err(priv->dev, "unsupported MAC force layout %d\n",
++			mb->chip_info->mac_force_layout);
++		return -EINVAL;
++	}
++}
++
+ static int rtl8365mb_ext_config_forcemode(struct realtek_priv *priv, int port,
+ 					  bool link, int speed, int duplex,
+ 					  bool tx_pause, bool rx_pause)
+ {
+ 	const struct rtl8365mb_extint *extint =
+ 		rtl8365mb_get_port_extint(priv, port);
++	struct rtl8365mb *mb = priv->chip_data;
+ 	u32 r_tx_pause;
+ 	u32 r_rx_pause;
+ 	u32 r_duplex;
+ 	u32 r_speed;
+ 	u32 r_link;
+ 	int val;
+-	int ret;
+ 
+ 	if (!extint)
+ 		return -ENODEV;
+@@ -1579,11 +1639,21 @@
+ 		r_rx_pause = rx_pause ? 1 : 0;
+ 		r_tx_pause = tx_pause ? 1 : 0;
+ 
+-		/* The speed field has no value for 2.5 Gbps: the rate is
+-		 * determined by the HSGMII SerDes configuration, and the
+-		 * vendor driver programs the 1 Gbps value here.
++		/* Family C uses the 1 Gbps MAC speed for HSGMII; family D
++		 * has a separate 2.5 Gbps encoding in a split speed field.
+ 		 */
+-		if (speed == SPEED_2500 || speed == SPEED_1000) {
++		if (speed == SPEED_2500) {
++			if (mb->chip_info->mac_force_layout ==
++			    RTL8365MB_MAC_FORCE_D && duplex != DUPLEX_FULL) {
++				dev_err(priv->dev,
++					"family-D 2.5 Gbps requires full duplex\n");
++				return -EINVAL;
++			}
++			r_speed = mb->chip_info->mac_force_layout ==
++				  RTL8365MB_MAC_FORCE_D ?
++				  RTL8367D_PORT_SPEED_2500M :
++				  RTL8365MB_PORT_SPEED_1000M;
++		} else if (speed == SPEED_1000) {
+ 			r_speed = RTL8365MB_PORT_SPEED_1000M;
+ 		} else if (speed == SPEED_100) {
+ 			r_speed = RTL8365MB_PORT_SPEED_100M;
+@@ -1613,22 +1683,17 @@
+ 		r_duplex = 0;
+ 	}
+ 
+-	val = FIELD_PREP(RTL8365MB_DIGITAL_INTERFACE_FORCE_EN_MASK, 1) |
+-	      FIELD_PREP(RTL8365MB_DIGITAL_INTERFACE_FORCE_TXPAUSE_MASK,
++	val = FIELD_PREP(RTL8365MB_DIGITAL_INTERFACE_FORCE_TXPAUSE_MASK,
+ 			 r_tx_pause) |
+ 	      FIELD_PREP(RTL8365MB_DIGITAL_INTERFACE_FORCE_RXPAUSE_MASK,
+ 			 r_rx_pause) |
+ 	      FIELD_PREP(RTL8365MB_DIGITAL_INTERFACE_FORCE_LINK_MASK, r_link) |
+ 	      FIELD_PREP(RTL8365MB_DIGITAL_INTERFACE_FORCE_DUPLEX_MASK,
+ 			 r_duplex) |
+-	      FIELD_PREP(RTL8365MB_DIGITAL_INTERFACE_FORCE_SPEED_MASK, r_speed);
+-	ret = regmap_write(priv->map,
+-			   RTL8365MB_DIGITAL_INTERFACE_FORCE_REG(extint->id),
+-			   val);
+-	if (ret)
+-		return ret;
++	      FIELD_PREP(RTL8365MB_DIGITAL_INTERFACE_FORCE_SPEED_MASK,
++			 r_speed & 0x3);
+ 
+-	return 0;
++	return rtl8365mb_ext_write_force(priv, extint, val, r_speed);
+ }
+ 
+ static void rtl8365mb_phylink_get_caps(struct dsa_switch *ds, int port,
