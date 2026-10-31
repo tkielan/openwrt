@@ -1,0 +1,219 @@
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: prepare NCTL-aware SerDes access
+
+Extract unlocked indirect read/write primitives while preserving the
+family-C commands and completion polling.
+
+Prepare a family-D read/write/update primitive for external ports 6 and 7.
+Use command selectors 0x0d and 0x0f and pause NCTL through register 0x612f,
+as verified in the running AX55 Pro switch module. A regmap mutex alone
+does not exclude the hardware NCTL engine from the indirect window.
+
+Serialize the entire pause/access/restore sequence, including masked
+read-modify-write operations. Restore the saved NCTL value on all access
+failures, report restoration failures and preserve the original error.
+Do not return a read result unless both the access and restoration succeed.
+
+Leave the family-D entry point unused until its initialization and PCS
+configuration are implemented. In particular, the stock NCTL program and
+SerDes tuning differ from the GPL U-Boot driver; do not substitute the
+family-C PCS configuration. This patch does not register family-D chips
+or enable Ethernet on the AX55 Pro.
+
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -273,6 +273,11 @@
+ #define RTL8365MB_SDS_INDACS_ADR_REG		0x6601
+ #define RTL8365MB_SDS_INDACS_DATA_REG		0x6602
+ 
++/* Family-D NCTL also accesses the indirect window independently of regmap. */
++#define RTL8367D_NCTL_EN_REG	0x612F
++#define RTL8367D_SDS_SELECTOR0	0x0D
++#define RTL8367D_SDS_SELECTOR1	0x0F
++
+ /* SerDes miscellaneous configuration register */
+ #define RTL8365MB_SDS_MISC_REG				0x1D11
+ #define   RTL8365MB_SDS_MISC_SGMII_RXFC_MASK		BIT(14)
+@@ -1171,68 +1176,153 @@
+ 	return 0;
+ }
+ 
+-static int rtl8365mb_sds_write(struct realtek_priv *priv, u16 addr, u16 data)
++static int rtl8365mb_sds_write_nolock(struct realtek_priv *priv, u8 selector,
++				      u16 addr, u16 data)
+ {
+ 	int ret;
+ 
+-	rtl83xx_lock(priv);
+-
+ 	ret = regmap_write(priv->map_nolock, RTL8365MB_SDS_INDACS_DATA_REG,
+ 			   data);
+ 	if (ret)
+-		goto out;
++		return ret;
+ 
+ 	ret = regmap_write(priv->map_nolock, RTL8365MB_SDS_INDACS_ADR_REG,
+ 			   addr);
+ 	if (ret)
+-		goto out;
++		return ret;
+ 
+ 	/* The SerDes indirect access engine completes the command within the
+ 	 * register write transaction, so there is no need to wait or poll for
+ 	 * completion before the next access, matching the vendor driver.
+ 	 */
+-	ret = regmap_write(priv->map_nolock, RTL8365MB_SDS_INDACS_CMD_REG,
+-			   RTL8365MB_SDS_INDACS_CMD_RUN_MASK |
+-			   RTL8365MB_SDS_INDACS_CMD_WR_MASK);
+-out:
+-	rtl83xx_unlock(priv);
+-
+-	return ret;
++	return regmap_write(priv->map_nolock, RTL8365MB_SDS_INDACS_CMD_REG,
++			    RTL8365MB_SDS_INDACS_CMD_RUN_MASK |
++			    RTL8365MB_SDS_INDACS_CMD_WR_MASK | selector);
+ }
+ 
+-static int rtl8365mb_sds_read(struct realtek_priv *priv, u16 addr, u16 *data)
++static int rtl8365mb_sds_read_nolock(struct realtek_priv *priv, u8 selector,
++				     u16 addr, u16 *data)
+ {
+ 	u32 val;
+ 	int ret;
+ 
+-	rtl83xx_lock(priv);
+-
+ 	ret = regmap_write(priv->map_nolock, RTL8365MB_SDS_INDACS_ADR_REG,
+ 			   addr);
+ 	if (ret)
+-		goto out;
++		return ret;
+ 
+ 	ret = regmap_write(priv->map_nolock, RTL8365MB_SDS_INDACS_CMD_REG,
+-			   RTL8365MB_SDS_INDACS_CMD_RUN_MASK);
++			   RTL8365MB_SDS_INDACS_CMD_RUN_MASK | selector);
+ 	if (ret)
+-		goto out;
++		return ret;
+ 
+-	/* Wait for the indirect read to complete: the engine clears the BUSY
+-	 * bit once the data register holds the result.
++	/* Family C clears BUSY once the result is ready. The family-D vendor
++	 * driver reads the data immediately after its selector command.
+ 	 */
+-	ret = regmap_read_poll_timeout(priv->map_nolock,
+-				       RTL8365MB_SDS_INDACS_CMD_REG, val,
+-				       !(val & RTL8365MB_SDS_INDACS_CMD_BUSY_MASK),
+-				       10, 1000);
+-	if (ret)
+-		goto out;
++	if (!selector) {
++		ret = regmap_read_poll_timeout(priv->map_nolock,
++					       RTL8365MB_SDS_INDACS_CMD_REG, val,
++					       !(val & RTL8365MB_SDS_INDACS_CMD_BUSY_MASK),
++					       10, 1000);
++		if (ret)
++			return ret;
++	}
+ 
+ 	ret = regmap_read(priv->map_nolock, RTL8365MB_SDS_INDACS_DATA_REG,
+ 			  &val);
+ 	if (ret)
+-		goto out;
++		return ret;
+ 
+ 	*data = val;
++	return 0;
++}
++
++static int rtl8365mb_sds_write(struct realtek_priv *priv, u16 addr, u16 data)
++{
++	int ret;
++
++	rtl83xx_lock(priv);
++	ret = rtl8365mb_sds_write_nolock(priv, 0, addr, data);
++	rtl83xx_unlock(priv);
++
++	return ret;
++}
++
++static int rtl8365mb_sds_read(struct realtek_priv *priv, u16 addr, u16 *data)
++{
++	int ret;
++
++	rtl83xx_lock(priv);
++	ret = rtl8365mb_sds_read_nolock(priv, 0, addr, data);
++	rtl83xx_unlock(priv);
++
++	return ret;
++}
++
++/* mask == 0 reads; otherwise replace masked bits with *data. Keep this
++ * primitive separate from the family-C PCS until family-D initialization
++ * and configuration are implemented.
++ */
++static int __maybe_unused
++rtl8367d_sds_access(struct realtek_priv *priv,
++		    const struct rtl8365mb_extint *extint, u16 addr,
++		    u16 mask, u16 *data)
++{
++	u32 nctl;
++	u16 value;
++	u8 selector;
++	int restore_ret;
++	int ret;
++
++	if (!data || extint->id < 1 || extint->id > 2 ||
++	    extint->port != 5 + extint->id) {
++		dev_err(priv->dev, "invalid family-D SerDes access on port %d\n",
++			extint->port);
++		return -EINVAL;
++	}
++
++	selector = extint->id == 1 ? RTL8367D_SDS_SELECTOR0 :
++				    RTL8367D_SDS_SELECTOR1;
++	rtl83xx_lock(priv);
++
++	ret = regmap_read(priv->map_nolock, RTL8367D_NCTL_EN_REG, &nctl);
++	if (ret)
++		goto out;
++
++	if (nctl) {
++		ret = regmap_write(priv->map_nolock, RTL8367D_NCTL_EN_REG, 0);
++		if (ret)
++			goto restore;
++	}
++
++	value = mask ? *data : 0;
++	if (mask != 0xFFFF) {
++		ret = rtl8365mb_sds_read_nolock(priv, selector, addr, &value);
++		if (ret)
++			goto restore;
++	}
++
++	if (mask) {
++		value = (value & ~mask) | (*data & mask);
++		ret = rtl8365mb_sds_write_nolock(priv, selector, addr, value);
++	}
++
++restore:
++	/* Restore even when pausing failed: the write may have reached hardware.
++	 * Do not hide the original error if restoration also fails.
++	 */
++	if (nctl) {
++		restore_ret = regmap_write(priv->map_nolock,
++					   RTL8367D_NCTL_EN_REG, nctl);
++		if (restore_ret) {
++			dev_err(priv->dev, "failed to restore NCTL: %pe\n",
++				ERR_PTR(restore_ret));
++			if (!ret)
++				ret = restore_ret;
++		}
++	}
++	if (!ret && !mask)
++		*data = value;
+ out:
+ 	rtl83xx_unlock(priv);
+ 
