@@ -11,9 +11,11 @@
 };
 
 /*
- * Serial/USB bring-up only. Leave Ethernet and Wi-Fi disabled until the
- * family-D switch/RTL8221B wiring, regional board-data selection and
- * radio MAC handling are verified. ART extraction offsets are known.
+ * Stock detects family D (ID 0x6642, revision 0x0050), with HSGMII on
+ * CPU port 7 and external WAN port 6. The RTL8221B uses MDIO address 6
+ * and active-low GPIO28 reset. The family-C RTL8367S driver is not
+ * register-compatible; leave Ethernet disabled pending family-D support.
+ * Wi-Fi still needs regional board-data selection and radio MAC handling.
  */
 &gmac0 {
 	status = "disabled";
