@@ -1,0 +1,153 @@
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: add separate family-D PCS operations
+
+Select separate PCS operations for the family-D external MAC layout.
+Connect PCS configuration to the verified family-D SerDes primitive and
+read link status through its NCTL-aware, per-interface indirect access.
+Stop marking those primitives unused now that the callbacks reference them.
+
+Advertise only in-band-disabled operation for supported SGMII/HSGMII
+interfaces. With negotiation disabled, phylink initializes speed, duplex
+and pause from its link configuration before calling pcs_get_state().
+Preserve those fields and report the independent SerDes link bit rather
+than reading MAC force state that is not written until link resolution.
+Keep link and negotiation completion down on access/restoration errors
+and report polling failures with rate-limited diagnostics.
+
+Family D needs no pcs_link_up register writes: the existing external MAC
+callback programs its split ability/enable registers with the resolved
+speed, duplex and pause. In particular, do not use the family-C SerDes
+MISC force bits, which are unrelated fields on family D.
+
+All registered chips still select the family-C PCS operations unchanged.
+Do not register family-D chips yet: switch/NCTL initialization, forwarding
+and other register-layout compatibility remain prerequisites. Ethernet
+on the AX55 Pro remains disabled.
+
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -1340,10 +1340,9 @@
+ }
+ 
+ /* mask == 0 reads; otherwise replace masked bits with *data. */
+-static int __maybe_unused
+-rtl8367d_sds_access(struct realtek_priv *priv,
+-		    const struct rtl8365mb_extint *extint, u16 addr,
+-		    u16 mask, u16 *data)
++static int rtl8367d_sds_access(struct realtek_priv *priv,
++			       const struct rtl8365mb_extint *extint, u16 addr,
++			       u16 mask, u16 *data)
+ {
+ 	u32 nctl;
+ 	u16 value;
+@@ -1385,12 +1384,11 @@
+ }
+ 
+ /* Configure only the verified 0x6642/0x0050 SerDes. Switch/NCTL initialization
+- * and family-D phylink callbacks must be implemented before using this.
++ * is still required before registering a family-D chip.
+  */
+-static int __maybe_unused
+-rtl8367d_sds_config(struct realtek_priv *priv,
+-		    const struct rtl8365mb_extint *extint,
+-		    unsigned int neg_mode, phy_interface_t interface)
++static int rtl8367d_sds_config(struct realtek_priv *priv,
++			       const struct rtl8365mb_extint *extint,
++			       unsigned int neg_mode, phy_interface_t interface)
+ {
+ 	struct rtl8365mb *mb = priv->chip_data;
+ 	const struct rtl8365mb_jam_tbl_entry *jam;
+@@ -1855,6 +1853,80 @@
+ 	.pcs_link_up = rtl8365mb_pcs_link_up,
+ };
+ 
++static unsigned int rtl8367d_pcs_inband_caps(struct phylink_pcs *pcs,
++					     phy_interface_t interface)
++{
++	struct rtl8365mb_pcs *spcs = pcs_to_rtl8365mb_pcs(pcs);
++	unsigned int mode;
++
++	switch (interface) {
++	case PHY_INTERFACE_MODE_SGMII:
++		mode = RTL8365MB_PHY_INTERFACE_MODE_SGMII;
++		break;
++	case PHY_INTERFACE_MODE_2500BASEX:
++		mode = RTL8365MB_PHY_INTERFACE_MODE_HSGMII;
++		break;
++	default:
++		return 0;
++	}
++
++	return spcs->extint->supported_interfaces & mode ?
++		LINK_INBAND_DISABLE : 0;
++}
++
++static int rtl8367d_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
++			       phy_interface_t interface,
++			       const unsigned long *advertising,
++			       bool permit_pause_to_mac)
++{
++	struct rtl8365mb_pcs *spcs = pcs_to_rtl8365mb_pcs(pcs);
++
++	return rtl8367d_sds_config(spcs->priv, spcs->extint, neg_mode, interface);
++}
++
++static void rtl8367d_pcs_get_state(struct phylink_pcs *pcs,
++				   unsigned int neg_mode,
++				   struct phylink_link_state *state)
++{
++	struct rtl8365mb_pcs *spcs = pcs_to_rtl8365mb_pcs(pcs);
++	struct realtek_priv *priv = spcs->priv;
++	u16 status;
++	int ret;
++
++	state->link = false;
++	state->an_complete = false;
++	if ((neg_mode & PHYLINK_PCS_NEG_ENABLED) ||
++	    !rtl8367d_pcs_inband_caps(pcs, state->interface)) {
++		dev_err_ratelimited(priv->dev, "unsupported family-D PCS state mode\n");
++		return;
++	}
++
++	ret = rtl8367d_sds_access(priv, spcs->extint,
++				  RTL8365MB_SDS_REG_LINK_STATUS, 0, &status);
++	if (ret) {
++		dev_err_ratelimited(priv->dev,
++				    "failed to read port %d SerDes status: %pe\n",
++				    spcs->extint->port, ERR_PTR(ret));
++		return;
++	}
++
++	/* With negotiation disabled, phylink supplies speed, duplex and pause.
++	 * Do not replace them with MAC force state that is only written after
++	 * link resolution. The SerDes link bit is independent of MAC force.
++	 */
++	state->link = !!(status & RTL8365MB_SDS_LINK_STATUS_LINK_MASK);
++	state->an_complete = state->link;
++}
++
++static const struct phylink_pcs_ops rtl8367d_pcs_ops = {
++	.pcs_inband_caps = rtl8367d_pcs_inband_caps,
++	.pcs_config = rtl8367d_pcs_config,
++	.pcs_get_state = rtl8367d_pcs_get_state,
++	/* Family D needs no PCS link_up writes: the external MAC callback
++	 * programs its split ability/enable registers with resolved pause.
++	 */
++};
++
+ static int rtl8365mb_ext_write_force(struct realtek_priv *priv,
+ 				     const struct rtl8365mb_extint *extint,
+ 				     u32 ability, u32 speed)
+@@ -3385,7 +3457,9 @@
+ 		spcs = &mb->pcs[extint->id];
+ 		spcs->priv = priv;
+ 		spcs->extint = extint;
+-		spcs->pcs.ops = &rtl8365mb_pcs_ops;
++		spcs->pcs.ops = mb->chip_info->mac_force_layout ==
++				RTL8365MB_MAC_FORCE_D ?
++				&rtl8367d_pcs_ops : &rtl8365mb_pcs_ops;
+ 		spcs->pcs.poll = true;
+ 	}
+ }
