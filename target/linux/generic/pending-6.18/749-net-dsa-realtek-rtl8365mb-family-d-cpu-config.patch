@@ -1,0 +1,97 @@
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: separate family-D CPU-tag configuration
+
+Select CPU-tag configuration for the family-D register layout. CPU mask
+and control register addresses are shared with family C, but family D
+has eight ports and a two-bit tag-format field at bits 10:9. Bit 10 is
+not the family-C extended trap-port selector. The field encodings were
+checked against the running Archer AX55 Pro stock switch module.
+
+Validate the port mask, trap port and CPU-tag settings before accessing
+hardware. Clear the aware-port mask when CPU tagging is disabled. Update
+only the documented configuration fields, preserving unrelated control
+bits while explicitly clearing the upper tag-format bit for the existing
+8-byte and 4-byte format values. Do not add the vendor's additional format.
+
+Hold the regmap lock across the mask and control updates and return the
+first hardware error. Keep existing family-C writes and extended trap
+port behavior unchanged.
+
+The stock family-D switch-init callback itself is a no-op; its NCTL program
+is loaded later in the SerDes mode path. Do not infer initialization
+compatibility or reuse the family-C jam table from that no-op. This patch
+does not register family-D chips, load NCTL firmware or establish wire-tag
+and forwarding compatibility. Ethernet on the AX55 Pro remains disabled.
+
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -377,6 +377,14 @@
+ #define   RTL8365MB_CPU_CTRL_INSERTMODE_MASK	GENMASK(2, 1)
+ #define   RTL8365MB_CPU_CTRL_EN_MASK		BIT(0)
+ 
++/* Family D uses bit 10 for tag format, not an extended trap-port bit. */
++#define RTL8367D_CPU_PORT_MASK		GENMASK(7, 0)
++#define RTL8367D_CPU_TAG_FORMAT_MASK	GENMASK(10, 9)
++#define RTL8367D_CPU_CTRL_CONFIG_MASK \
++	(RTL8365MB_CPU_CTRL_EN_MASK | RTL8365MB_CPU_CTRL_INSERTMODE_MASK | \
++	 RTL8365MB_CPU_CTRL_TRAP_PORT_MASK | RTL8365MB_CPU_CTRL_TAG_POSITION_MASK | \
++	 RTL8365MB_CPU_CTRL_RXBYTECOUNT_MASK | RTL8367D_CPU_TAG_FORMAT_MASK)
++
+ /* Maximum packet length register */
+ #define RTL8365MB_CFG0_MAX_LEN_REG	0x088C
+ #define   RTL8365MB_CFG0_MAX_LEN_MASK	GENMASK(13, 0)
+@@ -3330,6 +3338,42 @@
+ 	}
+ }
+ 
++static int rtl8367d_cpu_config(struct realtek_priv *priv)
++{
++	struct rtl8365mb *mb = priv->chip_data;
++	struct rtl8365mb_cpu *cpu = &mb->cpu;
++	u32 val;
++	int ret;
++
++	if (cpu->mask & ~RTL8367D_CPU_PORT_MASK || cpu->trap_port > 7 ||
++	    (cpu->enable && (!cpu->mask ||
++			    !(cpu->mask & BIT(cpu->trap_port)))) ||
++	    cpu->insert > RTL8365MB_CPU_INSERT_TO_NONE ||
++	    cpu->position > RTL8365MB_CPU_POS_BEFORE_CRC ||
++	    cpu->rx_length > RTL8365MB_CPU_RXLEN_64BYTES ||
++	    cpu->format > RTL8365MB_CPU_FORMAT_4BYTES) {
++		dev_err(priv->dev, "invalid family-D CPU-tag configuration\n");
++		return -EINVAL;
++	}
++
++	val = FIELD_PREP(RTL8365MB_CPU_CTRL_EN_MASK, cpu->enable) |
++	      FIELD_PREP(RTL8365MB_CPU_CTRL_INSERTMODE_MASK, cpu->insert) |
++	      FIELD_PREP(RTL8365MB_CPU_CTRL_TAG_POSITION_MASK, cpu->position) |
++	      FIELD_PREP(RTL8365MB_CPU_CTRL_RXBYTECOUNT_MASK, cpu->rx_length) |
++	      FIELD_PREP(RTL8367D_CPU_TAG_FORMAT_MASK, cpu->format) |
++	      FIELD_PREP(RTL8365MB_CPU_CTRL_TRAP_PORT_MASK, cpu->trap_port);
++
++	rtl83xx_lock(priv);
++	ret = regmap_update_bits(priv->map_nolock, RTL8365MB_CPU_PORT_MASK_REG,
++				 RTL8367D_CPU_PORT_MASK, cpu->enable ? cpu->mask : 0);
++	if (!ret)
++		ret = regmap_update_bits(priv->map_nolock, RTL8365MB_CPU_CTRL_REG,
++					 RTL8367D_CPU_CTRL_CONFIG_MASK, val);
++	rtl83xx_unlock(priv);
++
++	return ret;
++}
++
+ static int rtl8365mb_cpu_config(struct realtek_priv *priv)
+ {
+ 	struct rtl8365mb *mb = priv->chip_data;
+@@ -3337,6 +3381,9 @@
+ 	u32 val;
+ 	int ret;
+ 
++	if (mb->chip_info->mac_force_layout == RTL8365MB_MAC_FORCE_D)
++		return rtl8367d_cpu_config(priv);
++
+ 	ret = regmap_update_bits(priv->map, RTL8365MB_CPU_PORT_MASK_REG,
+ 				 RTL8365MB_CPU_PORT_MASK_MASK,
+ 				 FIELD_PREP(RTL8365MB_CPU_PORT_MASK_MASK,
