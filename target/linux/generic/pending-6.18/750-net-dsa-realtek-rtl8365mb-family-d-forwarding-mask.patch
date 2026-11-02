@@ -1,0 +1,142 @@
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: validate family-D forwarding masks
+
+The family-D port-isolation registers are at 0x08a2 plus the physical
+port, and its unknown-unicast, unknown-multicast and broadcast flooding
+masks are at 0x0890, 0x0891 and 0x0892. These addresses were verified in
+the running Archer AX55 Pro stock switch module. The documented masks
+contain only eight ports, rather than the eleven family-C ports.
+
+Share the eight-port limit with CPU-tag configuration. Validate family-D
+physical ports and destination masks before any register access or port
+bit shift in all three isolation and all three flooding callbacks. Report
+invalid configurations explicitly and retain zero isolation masks so DSA
+can disable forwarding during setup.
+
+Use a masked update for family-D isolation replacement, preserving bits
+outside the documented port field. Existing add/remove and flooding RMW
+operations already update only requested bits. Propagate hardware errors
+unchanged and preserve the existing family-C writes and port range.
+
+This does not register family-D chips or establish full bridge offload.
+NCTL initialization, wire-tag compatibility, learning, VLAN/FDB fields,
+bridge-domain handling and other active register paths still need
+verification. The AX55 Pro remains BROKEN-gated with Ethernet disabled.
+
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -378,7 +378,8 @@
+ #define   RTL8365MB_CPU_CTRL_EN_MASK		BIT(0)
+ 
+ /* Family D uses bit 10 for tag format, not an extended trap-port bit. */
+-#define RTL8367D_CPU_PORT_MASK		GENMASK(7, 0)
++#define RTL8367D_PORT_MASK		GENMASK(7, 0)
++#define RTL8367D_CPU_PORT_MASK		RTL8367D_PORT_MASK
+ #define RTL8367D_CPU_TAG_FORMAT_MASK	GENMASK(10, 9)
+ #define RTL8367D_CPU_CTRL_CONFIG_MASK \
+ 	(RTL8365MB_CPU_CTRL_EN_MASK | RTL8365MB_CPU_CTRL_INSERTMODE_MASK | \
+@@ -2616,9 +2617,31 @@
+ 			    enable ? RTL8365MB_LEARN_LIMIT_MAX : 0);
+ }
+ 
++static int rtl8365mb_validate_port_mask(struct realtek_priv *priv, int port,
++					u32 mask)
++{
++	struct rtl8365mb *mb = priv->chip_data;
++
++	if (mb->chip_info->mac_force_layout == RTL8365MB_MAC_FORCE_D &&
++	    (port < 0 || port > 7 || mask & ~RTL8367D_PORT_MASK)) {
++		dev_err(priv->dev,
++			"invalid family-D forwarding port %d or mask %#x\n",
++			port, mask);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static int rtl8365mb_port_set_ucast_flood(struct realtek_priv *priv, int port,
+ 					  bool enable)
+ {
++	int ret;
++
++	ret = rtl8365mb_validate_port_mask(priv, port, 0);
++	if (ret)
++		return ret;
++
+ 	/* Frames with unknown unicast DA will be flooded to a programmable
+ 	 * port mask that by default includes all ports. Add or remove
+ 	 * the specified port from this port mask accordingly.
+@@ -2631,6 +2654,12 @@
+ static int rtl8365mb_port_set_mcast_flood(struct realtek_priv *priv, int port,
+ 					  bool enable)
+ {
++	int ret;
++
++	ret = rtl8365mb_validate_port_mask(priv, port, 0);
++	if (ret)
++		return ret;
++
+ 	return regmap_update_bits(priv->map,
+ 			RTL8365MB_UNKNOWN_MULTICAST_FLOODING_PMASK_REG,
+ 			BIT(port), enable ? BIT(port) : 0);
+@@ -2639,6 +2668,12 @@
+ static int rtl8365mb_port_set_bcast_flood(struct realtek_priv *priv, int port,
+ 					  bool enable)
+ {
++	int ret;
++
++	ret = rtl8365mb_validate_port_mask(priv, port, 0);
++	if (ret)
++		return ret;
++
+ 	return regmap_update_bits(priv->map,
+ 			RTL8365MB_UNKNOWN_BROADCAST_FLOODING_PMASK_REG,
+ 			BIT(port), enable ? BIT(port) : 0);
+@@ -2681,6 +2716,18 @@
+ static int rtl8365mb_port_set_isolation(struct realtek_priv *priv, int port,
+ 					u32 mask)
+ {
++	struct rtl8365mb *mb = priv->chip_data;
++	int ret;
++
++	ret = rtl8365mb_validate_port_mask(priv, port, mask);
++	if (ret)
++		return ret;
++
++	if (mb->chip_info->mac_force_layout == RTL8365MB_MAC_FORCE_D)
++		return regmap_update_bits(priv->map,
++					  RTL8365MB_PORT_ISOLATION_REG(port),
++					  RTL8367D_PORT_MASK, mask);
++
+ 	return regmap_write(priv->map, RTL8365MB_PORT_ISOLATION_REG(port),
+ 			    mask);
+ }
+@@ -2688,6 +2735,12 @@
+ static int rtl8365mb_port_add_isolation(struct realtek_priv *priv, int port,
+ 					u32 mask)
+ {
++	int ret;
++
++	ret = rtl8365mb_validate_port_mask(priv, port, mask);
++	if (ret)
++		return ret;
++
+ 	return regmap_update_bits(priv->map, RTL8365MB_PORT_ISOLATION_REG(port),
+ 				  mask, mask);
+ }
+@@ -2695,6 +2748,12 @@
+ static int rtl8365mb_port_remove_isolation(struct realtek_priv *priv, int port,
+ 					   u32 mask)
+ {
++	int ret;
++
++	ret = rtl8365mb_validate_port_mask(priv, port, mask);
++	if (ret)
++		return ret;
++
+ 	return regmap_update_bits(priv->map, RTL8365MB_PORT_ISOLATION_REG(port),
+ 				  mask, 0);
+ }
