@@ -1,0 +1,296 @@
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: use direct PVID for family D
+
+The family-D stock driver stores the 12-bit VID directly in register
+0x0700 + physical port. This differs from family C, which stores a
+VLAN-membership-table index in paired-port registers. Add explicit
+family-D PVID read, set and clear paths while leaving family C unchanged.
+
+The stock driver uses the same two-bit accept-frame fields at 0x07aa for
+family D. Validate the family-D port range before accessing those fields,
+and restore the previous PVID/frame filter if a related update fails.
+
+This only covers the PVID path. Family-D VLAN4k table layout and other
+VLAN/FDB behavior still need verification; do not register family D or
+enable Ethernet until those paths and NCTL initialization are resolved.
+
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -914,6 +914,14 @@
+ 	bool sds_supported;
+ };
+ 
++bool rtl8365mb_is_family_d(struct realtek_priv *priv)
++{
++	struct rtl8365mb *mb = priv->chip_data;
++
++	return mb->chip_info &&
++	       mb->chip_info->mac_force_layout == RTL8365MB_MAC_FORCE_D;
++}
++
+ #define pcs_to_rtl8365mb_pcs(_pcs) \
+ 	container_of((_pcs), struct rtl8365mb_pcs, pcs)
+ 
+--- a/drivers/net/dsa/realtek/rtl8365mb_vlan.h
++++ b/drivers/net/dsa/realtek/rtl8365mb_vlan.h
+@@ -18,6 +18,7 @@
+ 	RTL8365MB_FRAME_TYPE_UNTAGGED_ONLY,
+ };
+ 
++bool rtl8365mb_is_family_d(struct realtek_priv *priv);
+ int rtl8365mb_vlan_port_get_pvid(struct realtek_priv *priv, int port,
+ 				 u16 *pvid);
+ int
+--- a/drivers/net/dsa/realtek/rtl8365mb_vlan.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_vlan.c
+@@ -15,13 +15,13 @@
+  * family. This means that the limit of 32 entries should not hinder us in
+  * programming a huge number of VLANs into the switch.
+  *
+- * One necessary use of the VLAN membership configuration database is for the
+- * programming of a port-based VLAN ID (PVID). The PVID is programmed on a
+- * per-port basis via register field, which refers to a specific VLAN membership
+- * configuration via an index 0~31. In order to maintain coherent behaviour on a
+- * port with a PVID, it is necessary to keep the VLAN configuration synchronized
+- * between the VLAN4k table and the VLAN membership configuration database.
++ * Family C uses the VLAN membership configuration database to program a
++ * port-based VLAN ID (PVID). Its per-port PVID register refers to a VLAN
++ * membership configuration via an index 0~31. To maintain coherent behaviour
++ * on a port with a PVID, the VLAN configuration must be synchronized between
++ * the VLAN4k table and the VLAN membership configuration database. Family D
++ * instead stores the VID directly in a per-port register.
+  *
+  * Since VLAN membership configs are a scarce resource, it will only be used
+  * when strictly needed (i.e. a VLAN with members using PVID). Otherwise, the
+  * VLAN4k will be enough.
+@@ -113,6 +113,11 @@
+ #define   RTL8365MB_VLAN_PVID_CTRL_PORT_MCIDX_MASK(_p) \
+ 		(0x1F << RTL8365MB_VLAN_PVID_CTRL_PORT_MCIDX_OFFSET(_p))
+ 
++/* Family D stores the VID directly, one register per physical port. */
++#define RTL8367D_VLAN_PVID_CTRL_REG(port)	(0x0700 + (port))
++#define RTL8367D_VLAN_PVID_CTRL_VID_MASK	GENMASK(11, 0)
++#define RTL8367D_MAX_PORT			7
++
+ /* Frame type filtering registers */
+ #define RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_BASE	0x07aa
+ #define RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_REG(port) \
+@@ -627,6 +632,17 @@
+ 	int ret;
+ 	u32 val;
+ 
++	if (rtl8365mb_is_family_d(priv)) {
++		if (port < 0 || port > RTL8367D_MAX_PORT ||
++		    vlanmc_idx > RTL8365MB_MAX_4K_VID)
++			return -EINVAL;
++
++		return regmap_update_bits(priv->map,
++					  RTL8367D_VLAN_PVID_CTRL_REG(port),
++					  RTL8367D_VLAN_PVID_CTRL_VID_MASK,
++					  vlanmc_idx);
++	}
++
+ 	dev_dbg(priv->dev, "set PVID IDX %d on port %d\n", vlanmc_idx, port);
+ 
+ 	val = vlanmc_idx << RTL8365MB_VLAN_PVID_CTRL_PORT_MCIDX_OFFSET(port);
+@@ -677,8 +693,22 @@
+ {
+ 	struct rtl8365mb_vlanmc vlanmc;
+ 	u8 vlanmc_idx;
++	u32 val;
+ 	int ret;
+ 
++	if (rtl8365mb_is_family_d(priv)) {
++		if (port < 0 || port > RTL8367D_MAX_PORT)
++			return -EINVAL;
++
++		ret = regmap_read(priv->map, RTL8367D_VLAN_PVID_CTRL_REG(port),
++				  &val);
++		if (ret)
++			return ret;
++
++		*pvid = FIELD_GET(RTL8367D_VLAN_PVID_CTRL_VID_MASK, val);
++		return 0;
++	}
++
+ 	ret = rtl8365mb_vlan_get_pvid_mc(priv, port, &vlanmc_idx, &vlanmc);
+ 	if (ret)
+ 		return ret;
+@@ -705,6 +735,10 @@
+ 	u32 val;
+ 	int ret;
+ 
++	if (rtl8365mb_is_family_d(priv) &&
++	    (port < 0 || port > RTL8367D_MAX_PORT))
++		return -EINVAL;
++
+ 	/* Even if ACCEPT_FRAME_TYPE_ANY, the switch will still check if the
+ 	 * port is a member of vlan PVID
+ 	 */
+@@ -737,6 +771,10 @@
+ {
+ 	u32 val;
+ 
++	if (rtl8365mb_is_family_d(priv) &&
++	    (port < 0 || port > RTL8367D_MAX_PORT))
++		return -EINVAL;
++
+ 	/* Even if ACCEPT_FRAME_TYPE_ANY, the switch will still check if the
+ 	 * port is a member of vlan PVID
+ 	 */
+@@ -749,16 +787,15 @@
+ }
+ 
+ /*
+- * rtl8365mb_vlan_pvid_port_set() - Configure a port's PVID and associated
+- * VLANMC entry
++ * rtl8365mb_vlan_pvid_port_set() - Configure a port's PVID
+  * @ds: dsa switch instance
+  * @port: port index
+  * @vid: target VID
+  * @extack: netlink extended ACK for error reporting
+  *
+- * Allocates or reuses a hardware VLANMC entry to map the given port to its new
+- * PVID. Gracefully unwinds and restores previous configuration if a hardware
+- * write operation fails during execution.
++ * Family C allocates or reuses a hardware VLANMC entry to map the given port
++ * to its new PVID. Family D stores the VID directly. Restore the previous
++ * configuration if a related hardware write fails.
+  *
+  * Context: Can sleep. Must be called with &priv->vlan_lock held.
+  * Takes and releases &priv->map_lock.
+@@ -777,6 +814,55 @@
+ 
+ 	lockdep_assert_held(&priv->vlan_lock);
+ 
++	if (rtl8365mb_is_family_d(priv)) {
++		u16 prev_pvid;
++		int undo_ret;
++
++		if (port < 0 || port > RTL8367D_MAX_PORT ||
++		    vid > RTL8365MB_MAX_4K_VID)
++			return -EINVAL;
++
++		ret = rtl8365mb_vlan_port_get_pvid(priv, port, &prev_pvid);
++		if (ret) {
++			dev_err(priv->dev, "Failed to read current family-D PVID\n");
++			return ret;
++		}
++
++		ret = rtl8365mb_vlan_port_get_framefilter(priv, port,
++							  &prev_accepted_frame);
++		if (ret) {
++			dev_err(priv->dev, "Failed to get current framefilter\n");
++			return ret;
++		}
++
++		ret = rtl8365mb_vlan_port_set_pvid(priv, port, vid);
++		if (ret) {
++			dev_err(priv->dev, "Failed to set family-D PVID\n");
++			return ret;
++		}
++
++		ret = rtl8365mb_vlan_port_set_framefilter(priv, port,
++							  RTL8365MB_FRAME_TYPE_ANY_FRAME);
++		if (ret) {
++			dev_err(priv->dev, "Failed to set port frame filter\n");
++			undo_ret = rtl8365mb_vlan_port_set_pvid(priv, port,
++								prev_pvid);
++			if (undo_ret)
++				dev_err(priv->dev,
++					"Failed to restore family-D PVID: %pe\n",
++					ERR_PTR(undo_ret));
++			undo_ret = rtl8365mb_vlan_port_set_framefilter(priv, port,
++								       prev_accepted_frame);
++			if (undo_ret)
++				dev_err(priv->dev,
++					"Failed to restore frame filter: %pe\n",
++					ERR_PTR(undo_ret));
++			return ret;
++		}
++
++		return 0;
++	}
++
+ 	/* Read the old PVID exclusively to undo in case of error */
+ 	ret = rtl8365mb_vlan_get_pvid_mc(priv, port, &prev_vlanmc_idx,
+ 					 &prev_vlanmc);
+@@ -862,8 +948,8 @@
+  * @port: port index
+  * @vid:  VLAN VID for PVID
+  *
+- * Resets the target port's hardware PVID allocation to 0. Cleans up and frees
+- * the associated VLANMC entry if no other ports are referencing it.
++ * Resets the target port's hardware PVID to 0. Family C also cleans up and
++ * frees the associated VLANMC entry if no other ports are referencing it.
+  *
+  * Context: Can sleep. Must be called with &priv->vlan_lock held.
+  * Takes and releases &priv->map_lock.
+@@ -879,6 +965,65 @@
+ 
+ 	lockdep_assert_held(&priv->vlan_lock);
+ 
++	if (rtl8365mb_is_family_d(priv)) {
++		u16 prev_pvid;
++		int undo_ret;
++
++		if (port < 0 || port > RTL8367D_MAX_PORT ||
++		    vid > RTL8365MB_MAX_4K_VID)
++			return -EINVAL;
++
++		ret = rtl8365mb_vlan_port_get_pvid(priv, port, &prev_pvid);
++		if (ret) {
++			dev_err(priv->dev, "Failed to read current family-D PVID\n");
++			return ret;
++		}
++
++		if (!prev_pvid || prev_pvid != vid)
++			return 0;
++
++		ret = rtl8365mb_vlan_port_get_framefilter(priv, port,
++							  &prev_accepted_frame);
++		if (ret) {
++			dev_err(priv->dev, "Failed to get current framefilter\n");
++			return ret;
++		}
++
++		accepted_frame = prev_accepted_frame;
++		if (dsa_port_is_vlan_filtering(dsa_to_port(ds, port))) {
++			accepted_frame = RTL8365MB_FRAME_TYPE_TAGGED_ONLY;
++			ret = rtl8365mb_vlan_port_set_framefilter(priv, port,
++								  accepted_frame);
++			if (ret) {
++				dev_err(priv->dev,
++					"Failed to set port frame filter\n");
++				return ret;
++			}
++		}
++
++		ret = rtl8365mb_vlan_port_set_pvid(priv, port, 0);
++		if (ret) {
++			dev_err(priv->dev, "Failed to clear family-D PVID\n");
++			undo_ret = rtl8365mb_vlan_port_set_pvid(priv, port,
++								prev_pvid);
++			if (undo_ret)
++				dev_err(priv->dev,
++					"Failed to restore family-D PVID: %pe\n",
++					ERR_PTR(undo_ret));
++			if (prev_accepted_frame != accepted_frame) {
++				undo_ret = rtl8365mb_vlan_port_set_framefilter(priv, port,
++									       prev_accepted_frame);
++				if (undo_ret)
++					dev_err(priv->dev,
++						"Failed to restore frame filter: %pe\n",
++						ERR_PTR(undo_ret));
++			}
++			return ret;
++		}
++
++		return 0;
++	}
++
+ 	ret = rtl8365mb_vlan_get_pvid_mc(priv, port, &vlanmc_idx,
+ 					 &vlanmc);
+ 	if (ret) {
