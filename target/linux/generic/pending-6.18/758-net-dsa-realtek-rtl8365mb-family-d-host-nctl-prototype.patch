@@ -1,0 +1,74 @@
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: prepare an inactive NCTL host-mode experiment
+
+Prepare an experimental host-managed NCTL setup primitive for the AX55 Pro
+switch, restricted to the family-D 0x6642/0x0050 register layout.
+
+Disable the NCTL engine using the same register as the existing family-D
+SerDes pause helper, and verify that it reads back disabled. Serialize the
+write and readback with all indirect SerDes transactions. Subsequent
+pause/restore transactions observe zero and must not restart the engine.
+Report every failure and return an error if the disable does not stick.
+Do not restore an unknown program after a failed preparation.
+
+OpenWrt PR #19644 contains a host-managed SerDes approach for family D,
+including receiver re-latching, but targets revision 0x0010 with its CPU
+on port 6. That is not evidence that the program can be omitted on the
+Pro's revision 0x0050 with CPU port 7 and two HSGMII lanes. Do not copy
+its family-C DW8051 reset handling onto the distinct NCTL engine.
+
+This helper is deliberately uncalled. It neither uploads firmware nor
+establishes NCTL quiescence timing, receiver re-latching, cold-boot
+initialization or working links. Do not register family D or add an
+automatic firmware-to-host fallback. A serial/RAM-boot experiment must
+validate both lanes and frame transfer before making this path active.
+
+Link: https://github.com/openwrt/openwrt/pull/19644
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -1310,5 +1310,43 @@
+ }
+ 
++/* Experimental only: callers must not assume a disabled NCTL is sufficient
++ * to initialize either SerDes. Keep this uncalled until hardware validation.
++ */
++static int __maybe_unused rtl8367d_nctl_host_prepare(struct realtek_priv *priv)
++{
++	struct rtl8365mb *mb = priv->chip_data;
++	u32 nctl;
++	int ret;
++
++	if (mb->chip_info->mac_force_layout != RTL8365MB_MAC_FORCE_D ||
++	    mb->chip_info->chip_id != 0x6642 ||
++	    mb->chip_info->chip_ver != 0x0050) {
++		dev_err(priv->dev, "unsupported family-D NCTL host-mode revision\n");
++		return -EOPNOTSUPP;
++	}
++
++	rtl83xx_lock(priv);
++	ret = regmap_write(priv->map_nolock, RTL8367D_NCTL_EN_REG, 0);
++	if (ret)
++		goto out;
++
++	ret = regmap_read(priv->map_nolock, RTL8367D_NCTL_EN_REG, &nctl);
++	if (ret)
++		goto out;
++	if (nctl) {
++		dev_err(priv->dev, "NCTL remains enabled: %#x\n", nctl);
++		ret = -EIO;
++	}
++
++out:
++	rtl83xx_unlock(priv);
++	if (ret)
++		dev_err(priv->dev, "failed to prepare NCTL host mode: %pe\n",
++			ERR_PTR(ret));
++
++	return ret;
++}
++
+ static int rtl8367d_sds_selector(struct realtek_priv *priv,
+ 				 const struct rtl8365mb_extint *extint)
+ {
