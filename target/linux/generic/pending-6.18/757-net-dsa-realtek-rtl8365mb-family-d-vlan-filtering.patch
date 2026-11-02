@@ -1,0 +1,83 @@
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: validate family-D VLAN ports
+
+The RTL8367D stock driver confirms that ingress filtering uses the
+per-physical-port bits in register 0x07a9, transparent egress uses an
+8-bit ingress mask in 0x09d0 + egress port, and VLAN egress mode uses the
+port misc-config register at 0x000e + (port << 5). Guard the active DSA
+VLAN-filtering path and each register helper to family D's verified ports
+0..7 before forming bit shifts or register addresses.
+
+The existing register encodings are shared with family C. Preserve that
+behavior and retain family-D VLAN filtering support without claiming
+bridge/FID isolation support. Family-D NCTL initialization and remaining
+DSA callback layouts are still outstanding; do not register family D or
+enable Ethernet based on this patch alone.
+
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -379,6 +379,7 @@
+ 
+ /* Family D uses bit 10 for tag format, not an extended trap-port bit. */
+ #define RTL8367D_PORT_MASK		GENMASK(7, 0)
++#define RTL8367D_MAX_PORT		7
+ #define RTL8367D_LEARN_LIMIT_MAX	2056
+ #define RTL8367D_CPU_PORT_MASK		RTL8367D_PORT_MASK
+ #define RTL8367D_CPU_TAG_FORMAT_MASK	GENMASK(10, 9)
+@@ -2338,6 +2339,14 @@
+ 					  int igr_port, int egr_port,
+ 					  bool enable)
+ {
++	if (rtl8365mb_is_family_d(priv) &&
++	    (igr_port < 0 || igr_port > RTL8367D_MAX_PORT ||
++	     egr_port < 0 || egr_port > RTL8367D_MAX_PORT)) {
++		dev_err(priv->dev, "invalid family-D transparent VLAN ports %d->%d\n",
++			igr_port, egr_port);
++		return -EINVAL;
++	}
++
+ 	dev_dbg(priv->dev, "%s transparent VLAN from %d to %d\n",
+ 		enable ? "Enable" : "Disable", igr_port, egr_port);
+ 
+@@ -2353,6 +2362,13 @@
+ static int rtl8365mb_port_set_ingress_filtering(struct realtek_priv *priv,
+ 						int port, bool enable)
+ {
++	if (rtl8365mb_is_family_d(priv) &&
++	    (port < 0 || port > RTL8367D_MAX_PORT)) {
++		dev_err(priv->dev, "invalid family-D ingress-filter port %d\n",
++			port);
++		return -EINVAL;
++	}
++
+ 	/* Ingress filtering enabled: Discard VLAN-tagged frames if the port is
+ 	 * not a member of the VLAN with which the packet is associated.
+ 	 * Untagged packets will also be discarded unless the port has a PVID
+@@ -2373,6 +2389,13 @@
+ {
+ 	u32 val;
+ 
++	if (rtl8365mb_is_family_d(priv) &&
++	    (port < 0 || port > RTL8367D_MAX_PORT)) {
++		dev_err(priv->dev, "invalid family-D VLAN egress-mode port %d\n",
++			port);
++		return -EINVAL;
++	}
++
+ 	val = FIELD_PREP(RTL8365MB_PORT_MISC_CFG_VLAN_EGRESS_MODE_MASK, mode);
+ 	return regmap_update_bits(priv->map,
+ 			RTL8365MB_PORT_MISC_CFG_REG(port),
+@@ -2391,6 +2414,12 @@
+ 	u16 pvid_vid;
+ 	int ret;
+ 
++	if (rtl8365mb_is_family_d(priv) &&
++	    (port < 0 || port > RTL8367D_MAX_PORT)) {
++		NL_SET_ERR_MSG_MOD(extack, "Invalid family-D switch port");
++		return -EINVAL;
++	}
++
+ 	dev_dbg(priv->dev, "port %d: %s VLAN filtering\n", port,
+ 		vlan_filtering ? "enable" : "disable");
