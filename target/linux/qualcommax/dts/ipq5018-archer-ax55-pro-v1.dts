@@ -13,16 +13,35 @@
 /*
  * Stock detects family D (ID 0x6642, revision 0x0050), with HSGMII on
  * CPU port 7 and external WAN port 6. The RTL8221B uses MDIO address 6
- * and active-low GPIO28 reset. The family-C RTL8367S driver is not
- * register-compatible; leave Ethernet disabled pending family-D support.
+ * and active-low GPIO28 reset. GMAC0 uses the integrated GE PHY; GMAC1
+ * connects to the switch CPU port over 2.5G HSGMII. Leave switch support
+ * pending a compatible family-D driver.
  * Wi-Fi still needs regional board-data selection and radio MAC handling.
  */
+&mdio0 {
+	status = "okay";
+};
+
+&uniphy0 {
+	status = "okay";
+
+	assigned-clocks = <&uniphy0 UNIPHY_CLK_REF>;
+	assigned-clock-rates = <UNIPHY_REFCLK_50MHZ>;
+};
+
 &gmac0 {
-	status = "disabled";
+	status = "okay";
 };
 
 &gmac1 {
-	status = "disabled";
+	status = "okay";
+
+	phy-mode = "2500base-x";
+
+	fixed-link {
+		speed = <2500>;
+		full-duplex;
+	};
 };
 
 &q6v5_wcss {
