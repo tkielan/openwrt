@@ -1,0 +1,107 @@
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: use family-D learning limit
+
+The family-D stock HAL advertises 2,056 LUT addresses, while family C
+uses 2,112. Program the family-D per-port limit accordingly and reject
+ports outside its eight-port register range before forming an address.
+Continue to use zero to disable learning and preserve family-C behavior.
+
+Do not treat family-D port-based FID as the family-C EFID. The stock
+family-D VLAN API enables a two-bit port-based FID in registers 0x07ac
+and 0x07ad+port; it is not the documented per-bridge EFID field and its
+interaction with VLAN FID has not been verified. Reject family-D EFID
+operations explicitly, omit the family-C EFID register write during
+setup, and disable DSA FDB bridge isolation/bridge numbering for this
+layout. This keeps bridge joining from silently using a shared EFID 0.
+
+This is not full family-D bridge support. Do not register family-D chips:
+NCTL initialization, VLAN/FDB behavior and bridge forwarding still need
+validation. Ethernet on the AX55 Pro remains disabled.
+
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -379,6 +379,7 @@
+ 
+ /* Family D uses bit 10 for tag format, not an extended trap-port bit. */
+ #define RTL8367D_PORT_MASK		GENMASK(7, 0)
++#define RTL8367D_LEARN_LIMIT_MAX	2056
+ #define RTL8367D_CPU_PORT_MASK		RTL8367D_PORT_MASK
+ #define RTL8367D_CPU_TAG_FORMAT_MASK	GENMASK(10, 9)
+ #define RTL8367D_CPU_CTRL_CONFIG_MASK \
+@@ -2608,13 +2609,25 @@
+ static int rtl8365mb_port_set_learning(struct realtek_priv *priv, int port,
+ 				       bool enable)
+ {
++	struct rtl8365mb *mb = priv->chip_data;
++
++	if (mb->chip_info->mac_force_layout == RTL8365MB_MAC_FORCE_D &&
++	    (port < 0 || port > 7)) {
++		dev_err(priv->dev, "invalid family-D learning port %d\n", port);
++		return -EINVAL;
++	}
++
+ 	/* Enable/disable learning by limiting the number of L2 addresses the
+ 	 * port can learn. Realtek documentation states that a limit of zero
+ 	 * disables learning. When enabling learning, set it to the chip's
+ 	 * maximum.
+ 	 */
+ 	return regmap_write(priv->map, RTL8365MB_LUT_PORT_LEARN_LIMIT_REG(port),
+-			    enable ? RTL8365MB_LEARN_LIMIT_MAX : 0);
++			    enable ?
++			    (mb->chip_info->mac_force_layout ==
++			     RTL8365MB_MAC_FORCE_D ?
++			     RTL8367D_LEARN_LIMIT_MAX :
++			     RTL8365MB_LEARN_LIMIT_MAX) : 0);
+ }
+ 
+ static int rtl8365mb_validate_port_mask(struct realtek_priv *priv, int port,
+@@ -2697,6 +2710,15 @@
+ static int rtl8365mb_port_set_efid(struct realtek_priv *priv, int port,
+ 				   u32 efid)
+ {
++	struct rtl8365mb *mb = priv->chip_data;
++
++	if (mb->chip_info->mac_force_layout == RTL8365MB_MAC_FORCE_D) {
++		dev_err(priv->dev,
++			"family-D bridge EFID is unsupported (port %d, EFID %u)\n",
++			port, efid);
++		return -EOPNOTSUPP;
++	}
++
+ 	return regmap_update_bits(priv->map, RTL8365MB_PORT_EFID_REG(port),
+ 				  RTL8365MB_PORT_EFID_MASK(port),
+ 				  efid << RTL8365MB_PORT_EFID_OFFSET(port));
+@@ -3653,10 +3675,12 @@
+ 		if (ret)
+ 			goto out_teardown_irq;
+ 
+-		/* Set the default EFID 0 for standalone mode */
+-		ret = rtl8365mb_port_set_efid(priv, dp->index, 0);
+-		if (ret)
+-			goto out_teardown_irq;
++		/* Family D has no verified equivalent for family-C EFID. */
++		if (mb->chip_info->mac_force_layout != RTL8365MB_MAC_FORCE_D) {
++			ret = rtl8365mb_port_set_efid(priv, dp->index, 0);
++			if (ret)
++				goto out_teardown_irq;
++		}
+ 
+ 		/* Disable learning */
+ 		ret = rtl8365mb_port_set_learning(priv, dp->index, false);
+@@ -3732,9 +3756,12 @@
+ 		goto out_teardown_irq;
+ 
+ 	ds->assisted_learning_on_cpu_port = true;
+-	ds->fdb_isolation = true;
+-	/* The EFID is 3 bits, but EFID 0 is reserved for standalone ports */
+-	ds->max_num_bridges = FIELD_MAX(RTL8365MB_EFID_MASK);
++	ds->fdb_isolation =
++		mb->chip_info->mac_force_layout != RTL8365MB_MAC_FORCE_D;
++	/* Family D's two-bit port-based FID is not a verified EFID substitute. */
++	ds->max_num_bridges =
++		mb->chip_info->mac_force_layout == RTL8365MB_MAC_FORCE_D ? 0 :
++		FIELD_MAX(RTL8365MB_EFID_MASK);
+ 
+ 	ds->configure_vlan_while_not_filtering = true;
