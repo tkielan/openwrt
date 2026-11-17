@@ -1,0 +1,344 @@
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Subject: [PATCH] net: dsa: realtek: rtl8365mb: prepare family-D SerDes configuration
+
+Add the SGMII and HSGMII tuning sequences verified in the running Archer
+AX55 Pro stock switch module. They differ from both the family-C tables
+and the older GPL U-Boot driver. Restrict the new configuration primitive
+to the verified chip ID 0x6642 and revision 0x0050.
+
+Configure the external-interface mux, analog enables, mode and in-band
+negotiation disable for either SerDes. Preserve unrelated register bits
+and reject the SDS0 mux when the combo PHY is forced to fiber. Use external
+interface IDs, not physical port numbers, for the family-D line-rate
+bypass bits.
+
+Share selector validation and NCTL pause/restore with the existing
+family-D indirect access primitive. Hold the regmap lock and keep NCTL
+paused across the entire configuration, including the final negotiation
+read-modify-write. Restore the saved NCTL state even when an operation
+fails, and retain both the original error and restoration diagnostics.
+
+Keep this primitive inactive. It does not load the stock NCTL program,
+perform switch initialization, implement family-D link-state callbacks
+or register family-D chips. Those prerequisites and forwarding support
+must be completed before enabling Ethernet on the AX55 Pro. Existing
+family-C PCS configuration and supported chips are unchanged.
+
+Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+--- a/drivers/net/dsa/realtek/rtl8365mb_main.c
++++ b/drivers/net/dsa/realtek/rtl8365mb_main.c
+@@ -277,6 +277,24 @@
+ #define RTL8367D_NCTL_EN_REG	0x612F
+ #define RTL8367D_SDS_SELECTOR0	0x0D
+ #define RTL8367D_SDS_SELECTOR1	0x0F
++#define RTL8367D_SDS_MISC0_REG		0x1D11
++#define RTL8367D_SDS_MISC1_REG		0x1D78
++#define RTL8367D_SDS_MODE_MASK		GENMASK(4, 0)
++#define RTL8367D_SDS_MODE_SGMII		0x02
++#define RTL8367D_SDS_MODE_HSGMII		0x12
++#define RTL8367D_SDS0_MAC6_SEL_MASK	BIT(9)
++#define RTL8367D_SDS0_ANALOG_MASK		GENMASK(11, 10)
++#define RTL8367D_SDS1_ANALOG_MASK		GENMASK(10, 9)
++#define RTL8367D_TOP_CON0_REG		0x1D70
++#define RTL8367D_MAC4_EXT_SEL_MASK	BIT(12)
++#define RTL8367D_MAC7_EXT_SEL_MASK	BIT(13)
++#define RTL8367D_INTERFACE_SELECT_REG	0x1305
++#define RTL8367D_INTERFACE_SELECT_MASK	GENMASK(7, 4)
++#define RTL8367D_FIBER_CFG_REG		0x13E8
++#define RTL8367D_SDS_RX_DISABLE_MASK	GENMASK(7, 6)
++#define RTL8367D_UTP_FIB_DET_REG		0x13EB
++#define RTL8367D_COMBO_FIBER_MASK		GENMASK(15, 14)
++#define RTL8367D_BYPASS_LINE_RATE_REG	0x03F7
+ 
+ /* SerDes miscellaneous configuration register */
+ #define RTL8365MB_SDS_MISC_REG				0x1D11
+@@ -660,6 +678,19 @@
+ 	{ 0x0424, 0xD810 }, { 0x0001, 0x0F80 }, { 0x002E, 0x83F2 },
+ };
+ 
++/* Verified in the AX55 Pro stock module; not the family-C or U-Boot tables. */
++static const struct rtl8365mb_jam_tbl_entry rtl8367d_sds_jam_sgmii[] = {
++	{ 0x0427, 0x4E0C }, { 0x0428, 0xAA00 }, { 0x0425, 0x5189 },
++	{ 0x0424, 0x8414 }, { 0x0423, 0x1020 }, { 0x0410, 0x0002 },
++	{ 0x0484, 0x011B }, { 0x0421, 0x8E13 }, { 0x0422, 0x1140 },
++};
++
++static const struct rtl8365mb_jam_tbl_entry rtl8367d_sds_jam_hsgmii[] = {
++	{ 0x0427, 0x4E0C }, { 0x0428, 0xAA00 }, { 0x0425, 0x5189 },
++	{ 0x0424, 0x8414 }, { 0x0423, 0x1020 }, { 0x0410, 0x0002 },
++	{ 0x0504, 0x051B }, { 0x0421, 0x8E13 }, { 0x0422, 0x1140 },
++};
++
+ enum rtl8365mb_phy_interface_mode {
+ 	RTL8365MB_PHY_INTERFACE_MODE_INVAL = 0,
+ 	RTL8365MB_PHY_INTERFACE_MODE_INTERNAL = BIT(0),
+@@ -1259,10 +1290,56 @@
+ 	return ret;
+ }
+ 
+-/* mask == 0 reads; otherwise replace masked bits with *data. Keep this
+- * primitive separate from the family-C PCS until family-D initialization
+- * and configuration are implemented.
+- */
++static int rtl8367d_sds_selector(struct realtek_priv *priv,
++				 const struct rtl8365mb_extint *extint)
++{
++	if (!extint || extint->id < 1 || extint->id > 2 ||
++	    extint->port != 5 + extint->id) {
++		dev_err(priv->dev, "invalid family-D SerDes mapping\n");
++		return -EINVAL;
++	}
++
++	return extint->id == 1 ? RTL8367D_SDS_SELECTOR0 :
++				RTL8367D_SDS_SELECTOR1;
++}
++
++static int rtl8367d_nctl_restore(struct realtek_priv *priv, u32 nctl, int ret)
++{
++	int restore_ret;
++
++	/* Restore even when pausing failed: the write may have reached hardware.
++	 * Do not hide the original error if restoration also fails.
++	 */
++	if (nctl) {
++		restore_ret = regmap_write(priv->map_nolock,
++					   RTL8367D_NCTL_EN_REG, nctl);
++		if (restore_ret) {
++			dev_err(priv->dev, "failed to restore NCTL: %pe\n",
++				ERR_PTR(restore_ret));
++			if (!ret)
++				ret = restore_ret;
++		}
++	}
++	return ret;
++}
++
++/* Caller holds the regmap lock through pause, operation and restoration. */
++static int rtl8367d_nctl_pause(struct realtek_priv *priv, u32 *nctl)
++{
++	int ret;
++
++	ret = regmap_read(priv->map_nolock, RTL8367D_NCTL_EN_REG, nctl);
++	if (ret || !*nctl)
++		return ret;
++
++	ret = regmap_write(priv->map_nolock, RTL8367D_NCTL_EN_REG, 0);
++	if (ret)
++		return rtl8367d_nctl_restore(priv, *nctl, ret);
++
++	return 0;
++}
++
++/* mask == 0 reads; otherwise replace masked bits with *data. */
+ static int __maybe_unused
+ rtl8367d_sds_access(struct realtek_priv *priv,
+ 		    const struct rtl8365mb_extint *extint, u16 addr,
+@@ -1270,31 +1347,22 @@
+ {
+ 	u32 nctl;
+ 	u16 value;
+-	u8 selector;
+-	int restore_ret;
++	int selector;
+ 	int ret;
+ 
+-	if (!data || extint->id < 1 || extint->id > 2 ||
+-	    extint->port != 5 + extint->id) {
+-		dev_err(priv->dev, "invalid family-D SerDes access on port %d\n",
+-			extint->port);
++	selector = rtl8367d_sds_selector(priv, extint);
++	if (selector < 0)
++		return selector;
++	if (!data) {
++		dev_err(priv->dev, "missing family-D SerDes data\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	selector = extint->id == 1 ? RTL8367D_SDS_SELECTOR0 :
+-				    RTL8367D_SDS_SELECTOR1;
+ 	rtl83xx_lock(priv);
+-
+-	ret = regmap_read(priv->map_nolock, RTL8367D_NCTL_EN_REG, &nctl);
++	ret = rtl8367d_nctl_pause(priv, &nctl);
+ 	if (ret)
+ 		goto out;
+ 
+-	if (nctl) {
+-		ret = regmap_write(priv->map_nolock, RTL8367D_NCTL_EN_REG, 0);
+-		if (ret)
+-			goto restore;
+-	}
+-
+ 	value = mask ? *data : 0;
+ 	if (mask != 0xFFFF) {
+ 		ret = rtl8365mb_sds_read_nolock(priv, selector, addr, &value);
+@@ -1306,26 +1374,154 @@
+ 		value = (value & ~mask) | (*data & mask);
+ 		ret = rtl8365mb_sds_write_nolock(priv, selector, addr, value);
+ 	}
+-
+ restore:
+-	/* Restore even when pausing failed: the write may have reached hardware.
+-	 * Do not hide the original error if restoration also fails.
+-	 */
+-	if (nctl) {
+-		restore_ret = regmap_write(priv->map_nolock,
+-					   RTL8367D_NCTL_EN_REG, nctl);
+-		if (restore_ret) {
+-			dev_err(priv->dev, "failed to restore NCTL: %pe\n",
+-				ERR_PTR(restore_ret));
+-			if (!ret)
+-				ret = restore_ret;
+-		}
+-	}
++	ret = rtl8367d_nctl_restore(priv, nctl, ret);
+ 	if (!ret && !mask)
+ 		*data = value;
+ out:
+ 	rtl83xx_unlock(priv);
+ 
++	return ret;
++}
++
++/* Configure only the verified 0x6642/0x0050 SerDes. Switch/NCTL initialization
++ * and family-D phylink callbacks must be implemented before using this.
++ */
++static int __maybe_unused
++rtl8367d_sds_config(struct realtek_priv *priv,
++		    const struct rtl8365mb_extint *extint,
++		    unsigned int neg_mode, phy_interface_t interface)
++{
++	struct rtl8365mb *mb = priv->chip_data;
++	const struct rtl8365mb_jam_tbl_entry *jam;
++	size_t jam_size;
++	size_t i;
++	u32 misc, analog, mode, media, nctl;
++	u16 nway;
++	int selector;
++	int ret;
++
++	selector = rtl8367d_sds_selector(priv, extint);
++	if (selector < 0)
++		return selector;
++	if (mb->chip_info->chip_id != 0x6642 ||
++	    mb->chip_info->chip_ver != 0x0050) {
++		dev_err(priv->dev, "unverified family-D SerDes revision\n");
++		return -EOPNOTSUPP;
++	}
++	if (neg_mode & PHYLINK_PCS_NEG_ENABLED) {
++		dev_err(priv->dev, "family-D in-band negotiation is unsupported\n");
++		return -EOPNOTSUPP;
++	}
++
++	switch (interface) {
++	case PHY_INTERFACE_MODE_SGMII:
++		jam = rtl8367d_sds_jam_sgmii;
++		jam_size = ARRAY_SIZE(rtl8367d_sds_jam_sgmii);
++		mode = RTL8367D_SDS_MODE_SGMII;
++		break;
++	case PHY_INTERFACE_MODE_2500BASEX:
++		jam = rtl8367d_sds_jam_hsgmii;
++		jam_size = ARRAY_SIZE(rtl8367d_sds_jam_hsgmii);
++		mode = RTL8367D_SDS_MODE_HSGMII;
++		break;
++	default:
++		dev_err(priv->dev, "unsupported family-D SerDes interface %d\n",
++			interface);
++		return -EOPNOTSUPP;
++	}
++	if (!(extint->supported_interfaces &
++	      (interface == PHY_INTERFACE_MODE_SGMII ?
++	       RTL8365MB_PHY_INTERFACE_MODE_SGMII :
++	       RTL8365MB_PHY_INTERFACE_MODE_HSGMII))) {
++		dev_err(priv->dev, "unsupported family-D interface on port %d\n",
++			extint->port);
++		return -EOPNOTSUPP;
++	}
++
++	misc = extint->id == 1 ? RTL8367D_SDS_MISC0_REG :
++				RTL8367D_SDS_MISC1_REG;
++	analog = extint->id == 1 ? RTL8367D_SDS0_ANALOG_MASK :
++				  RTL8367D_SDS1_ANALOG_MASK;
++
++	rtl83xx_lock(priv);
++	/* SDS0 is shared with the combo PHY; never steal a forced fiber link. */
++	if (extint->id == 1) {
++		ret = regmap_read(priv->map_nolock, RTL8367D_TOP_CON0_REG, &media);
++		if (ret)
++			goto out;
++		if (!(media & RTL8367D_MAC4_EXT_SEL_MASK)) {
++			ret = regmap_read(priv->map_nolock, RTL8367D_UTP_FIB_DET_REG,
++					  &media);
++			if (ret)
++				goto out;
++			if ((media & RTL8367D_COMBO_FIBER_MASK) ==
++			    RTL8367D_COMBO_FIBER_MASK) {
++				dev_err(priv->dev, "family-D SDS0 is used by fiber\n");
++				ret = -EBUSY;
++				goto out;
++			}
++		}
++	}
++
++	ret = rtl8367d_nctl_pause(priv, &nctl);
++	if (ret)
++		goto out;
++
++	ret = regmap_update_bits(priv->map_nolock, RTL8367D_BYPASS_LINE_RATE_REG,
++				 BIT(extint->id), 0);
++	if (ret)
++		goto restore;
++	if (extint->id == 1) {
++		ret = regmap_update_bits(priv->map_nolock, misc,
++					 RTL8367D_SDS0_MAC6_SEL_MASK,
++					 RTL8367D_SDS0_MAC6_SEL_MASK);
++	} else {
++		ret = regmap_update_bits(priv->map_nolock,
++					 RTL8367D_INTERFACE_SELECT_REG,
++					 RTL8367D_INTERFACE_SELECT_MASK, 0);
++		if (ret)
++			goto restore;
++		ret = regmap_update_bits(priv->map_nolock, RTL8367D_TOP_CON0_REG,
++					 RTL8367D_MAC7_EXT_SEL_MASK, 0);
++	}
++	if (ret)
++		goto restore;
++
++	for (i = 0; i < jam_size; i++) {
++		ret = rtl8365mb_sds_write_nolock(priv, selector,
++						 jam[i].reg, jam[i].val);
++		if (ret)
++			goto restore;
++	}
++	if (extint->id == 1) {
++		ret = regmap_update_bits(priv->map_nolock, RTL8367D_FIBER_CFG_REG,
++					 RTL8367D_SDS_RX_DISABLE_MASK,
++					 FIELD_PREP(RTL8367D_SDS_RX_DISABLE_MASK, 1));
++		if (ret)
++			goto restore;
++	}
++	ret = regmap_update_bits(priv->map_nolock, misc, analog, analog);
++	if (ret)
++		goto restore;
++	ret = regmap_update_bits(priv->map_nolock, misc,
++				 RTL8367D_SDS_MODE_MASK, mode);
++	if (ret)
++		goto restore;
++
++	ret = rtl8365mb_sds_read_nolock(priv, selector,
++					RTL8365MB_SDS_REG_NWAY, &nway);
++	if (ret)
++		goto restore;
++	nway &= ~RTL8365MB_SDS_NWAY_EN_MASK;
++	nway |= RTL8365MB_SDS_NWAY_RESTART_MASK;
++	ret = rtl8365mb_sds_write_nolock(priv, selector,
++					 RTL8365MB_SDS_REG_NWAY, nway);
++restore:
++	ret = rtl8367d_nctl_restore(priv, nctl, ret);
++out:
++	rtl83xx_unlock(priv);
++
+ 	return ret;
+ }
+ 
