@@ -4,6 +4,7 @@
 
 #include "ipq5018-archer-ax55-common.dtsi"
 #include "ipq5018-ess.dtsi"
+#include "ipq5018-qcn6122.dtsi"
 
 / {
 	model = "TP-Link Archer AX55 Pro v1";
@@ -12,11 +13,13 @@
 
 /*
  * Stock detects family D (ID 0x6642, revision 0x0050), with HSGMII on
- * CPU port 7 and external WAN port 6. The RTL8221B uses MDIO address 6
- * and active-low GPIO28 reset. GMAC0 uses the integrated GE PHY; GMAC1
- * connects to the switch CPU port over 2.5G HSGMII. Leave switch support
- * pending a compatible family-D driver.
- * Wi-Fi still needs regional board-data selection and radio MAC handling.
+ * CPU port 7 and external WAN port 6. The 2.5G PHY uses MDIO address 6
+ * and active-low GPIO28 reset. Stock reports ID 0xc849 and uses an
+ * RTL8226B initialization path; its exact identification needs checking.
+ * GMAC0 uses the integrated GE PHY; GMAC1 connects to the switch CPU port
+ * over 2.5G HSGMII. Leave switch support pending a compatible family-D driver.
+ * The radios remain disabled until matching board data is available and
+ * their operation has been verified on hardware.
  */
 &mdio0 {
 	status = "okay";
@@ -46,8 +49,28 @@
 
 &q6v5_wcss {
 	status = "disabled";
+
+	/* Stock uses userpd 2 with PCIe 0 reset on GPIO15. */
+	boot-args = <0x1 0x4 0x2 0xf 0x0 0x0>;
 };
 
 &wifi {
 	status = "disabled";
+
+	qcom,rproc = <&q6_wcss_pd1>;
+	qcom,userpd-subsys-name = "q6v5_wcss_userpd1";
+	qcom,ath11k-fw-memory-mode = <1>;
+	qcom,calibration-variant = "TP-Link-Archer-AX55-Pro-v1";
+	qcom,bdf-addr = <0x4c400000>;
+};
+
+&wifi1 {
+	status = "disabled";
+
+	qcom,rproc = <&q6_wcss_pd2>;
+	qcom,userpd-subsys-name = "q6v5_wcss_userpd2";
+	qcom,ath11k-fw-memory-mode = <1>;
+	qcom,calibration-variant = "TP-Link-Archer-AX55-Pro-v1";
+	qcom,bdf-addr = <0x4d100000>;
+	qcom,m3-dump-addr = <0x4df00000>;
 };

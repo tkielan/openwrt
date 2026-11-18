@@ -376,8 +376,8 @@ define Device/tplink_archer-ax55-pro-v1
 		kmod-usb-ledtrig-usbport
 	DEVICE_DESCRIPTION := Experimental serial/USB bring-up only; Ethernet and Wi-Fi are disabled. \
 		Requires serial access and a verified recovery method. \
-		ART extraction is wired; family-D switch/dual-SerDes support, regional board-data \
-		selection and radio MAC handling remain unresolved. \
+		Radio wiring and ART extraction are prepared; matching board data, radio validation \
+		and family-D switch/dual-SerDes support remain unresolved. \
 		No OEM factory installation image is provided.
 endef
 TARGET_DEVICES += tplink_archer-ax55-pro-v1

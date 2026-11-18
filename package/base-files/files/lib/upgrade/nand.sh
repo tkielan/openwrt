@@ -340,8 +340,14 @@ nand_upgrade_tar() {
 			# On some devices, the raw kernel and ubi partitions overlap.
 			# These devices brick if the kernel partition is erased.
 			# Hence only invalidate kernel for now.
-			dd if=/dev/zero bs=4096 count=1 2> /dev/null | \
-				mtd write - "$CI_KERNPART"
+			(
+				set -o pipefail
+				dd if=/dev/zero bs=4096 count=1 2> /dev/null | \
+					mtd write - "$CI_KERNPART"
+			) || {
+				echo "cannot invalidate kernel partition"
+				return 1
+			}
 		else
 			ubi_kernel_length="$kernel_length"
 		fi
@@ -353,24 +359,51 @@ nand_upgrade_tar() {
 	if [ "$rootfs_length" ]; then
 		local ubidev="$( nand_find_ubi "${CI_ROOT_UBIPART:-$CI_UBIPART}" )"
 		local root_ubivol="$( nand_find_volume $ubidev "$CI_ROOTPART" )"
-		$cmd < "$tar_file" | tar xOf - "$board_dir/root" | \
-			ubiupdatevol /dev/$root_ubivol -s "$rootfs_length" -
+		(
+			set -o pipefail
+			$cmd < "$tar_file" | tar xOf - "$board_dir/root" | \
+				ubiupdatevol /dev/$root_ubivol -s "$rootfs_length" -
+		) || {
+			echo "cannot write rootfs volume"
+			return 1
+		}
 	fi
 	if [ "$kernel_length" ]; then
 		if [ "$kernel_mtd" ]; then
 			if [ "$jffs2_markers" = 1 ]; then
-				flash_erase -j "/dev/mtd${kernel_mtd}" 0 0
-				$cmd < "$tar_file" | tar xOf - "$board_dir/kernel" | \
-					nandwrite "/dev/mtd${kernel_mtd}" -
+				flash_erase -j "/dev/mtd${kernel_mtd}" 0 0 || {
+					echo "cannot erase kernel partition"
+					return 1
+				}
+				(
+					set -o pipefail
+					$cmd < "$tar_file" | tar xOf - "$board_dir/kernel" | \
+						nandwrite "/dev/mtd${kernel_mtd}" -
+				) || {
+					echo "cannot write kernel partition"
+					return 1
+				}
 			else
-				$cmd < "$tar_file" | tar xOf - "$board_dir/kernel" | \
-					mtd write - "$CI_KERNPART"
+				(
+					set -o pipefail
+					$cmd < "$tar_file" | tar xOf - "$board_dir/kernel" | \
+						mtd write - "$CI_KERNPART"
+				) || {
+					echo "cannot write kernel partition"
+					return 1
+				}
 			fi
 		else
 			local ubidev="$( nand_find_ubi "${CI_KERN_UBIPART:-$CI_UBIPART}" )"
 			local kern_ubivol="$( nand_find_volume $ubidev "$CI_KERNPART" )"
-			$cmd < "$tar_file" | tar xOf - "$board_dir/kernel" | \
-				ubiupdatevol /dev/$kern_ubivol -s "$kernel_length" -
+			(
+				set -o pipefail
+				$cmd < "$tar_file" | tar xOf - "$board_dir/kernel" | \
+					ubiupdatevol /dev/$kern_ubivol -s "$kernel_length" -
+			) || {
+				echo "cannot write kernel volume"
+				return 1
+			}
 		fi
 	fi
 

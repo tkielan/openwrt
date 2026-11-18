@@ -3,7 +3,7 @@
 PART_NAME=firmware
 REQUIRE_IMAGE_METADATA=1
 
-RAMFS_COPY_BIN='dumpimage fw_printenv fw_setenv head seq'
+RAMFS_COPY_BIN='dumpimage fw_printenv fw_setenv head mktemp seq'
 RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock'
 
 fritzbox_remove_oem_ubi_volumes() {
@@ -172,8 +172,113 @@ linksys_mx_pre_upgrade() {
 	fi
 }
 
+ax55_pro_check_image() {
+	local file="$1" cmd board_dirs part length
+
+	cmd="$(identify_if_gzip "$file")cat"
+	board_dirs="$(
+		set -o pipefail
+		$cmd < "$file" | tar tf - | grep '^sysupgrade-.*/$'
+	)" || {
+		echo "unable to read sysupgrade image directory" >&2
+		return 1
+	}
+	[ "$board_dirs" = "sysupgrade-tplink_archer-ax55-pro-v1/" ] || {
+		echo "unexpected or multiple sysupgrade image directories" >&2
+		return 1
+	}
+	for part in kernel root; do
+		length="$(
+			set -o pipefail
+			$cmd < "$file" | \
+				tar xOf - "sysupgrade-tplink_archer-ax55-pro-v1/$part" | wc -c
+		)" || {
+			echo "unable to read $part from sysupgrade image" >&2
+			return 1
+		}
+		[ "$length" -gt 0 ] || {
+			echo "empty $part in sysupgrade image" >&2
+			return 1
+		}
+	done
+}
+
+ax55_pro_select_upgrade_slot() {
+	local active tp bc bcidx bcfile primaryboot
+
+	case " $(cat /proc/cmdline) " in
+		*" ubi.mtd=rootfs "*"ubi.mtd=rootfs_1 "*|\
+		*" ubi.mtd=rootfs_1 "*"ubi.mtd=rootfs "*)
+			echo "multiple rootfs slots in kernel command line" >&2
+			return 1
+			;;
+		*" ubi.mtd=rootfs_1 "*)
+			active=1
+			ax55_pro_upgrade_idx=0
+			CI_UBIPART="rootfs"
+			;;
+		*" ubi.mtd=rootfs "*)
+			active=0
+			ax55_pro_upgrade_idx=1
+			CI_UBIPART="rootfs_1"
+			;;
+		*)
+			echo "unable to identify the running rootfs slot" >&2
+			return 1
+			;;
+	esac
+
+	tp="$(fw_printenv -n tp_boot_idx 2>&1)" || {
+		echo "unable to read tp_boot_idx: $tp" >&2
+		return 1
+	}
+	case "$tp" in
+		0|1) ;;
+		*)
+			echo "invalid tp_boot_idx or environment warning: $tp" >&2
+			return 1
+			;;
+	esac
+	[ "$tp" = "$active" ] || {
+		echo "tp_boot_idx does not match the running rootfs slot" >&2
+		return 1
+	}
+	bcfile="$(mktemp /tmp/ax55-pro-bootconfig.XXXXXX)" || {
+		echo "unable to create bootconfig copy" >&2
+		return 1
+	}
+	# Only the stock primaryboot=0 slot mapping has been verified.
+	for bc in "0:BOOTCONFIG" "0:BOOTCONFIG1"; do
+		bcidx="$(find_mtd_index "$bc")"
+		if [ -z "$bcidx" ] || \
+		   ! dd if="/dev/mtd$bcidx" of="$bcfile" bs=2048 count=1 2>/dev/null || \
+		   ! validate_bootconfig_magic "$bcfile"; then
+			echo "unable to validate $bc" >&2
+			rm -f "$bcfile"
+			return 1
+		fi
+		primaryboot="$(get_bootconfig_primaryboot "$bcfile" "rootfs")"
+		if [ "$primaryboot" != "0" ]; then
+			echo "unsupported $bc rootfs primaryboot: $primaryboot" >&2
+			rm -f "$bcfile"
+			return 1
+		fi
+	done
+	rm -f "$bcfile"
+	[ -n "$(find_mtd_index "$CI_UBIPART")" ] || {
+		echo "inactive rootfs partition not found" >&2
+		return 1
+	}
+}
+
 platform_check_image() {
-	return 0;
+	case "$(board_name)" in
+	tplink,archer-ax55-pro-v1)
+		ax55_pro_check_image "$1" || return 1
+		ax55_pro_select_upgrade_slot || return 1
+		;;
+	esac
+	return 0
 }
 
 platform_pre_upgrade() {
@@ -286,7 +391,35 @@ platform_do_upgrade() {
 		fi
 		nand_do_upgrade_success
 		;;
-	tplink,archer-ax55-pro-v1|\
+	tplink,archer-ax55-pro-v1)
+		ax55_pro_check_image "$1" && ax55_pro_select_upgrade_slot || {
+			nand_do_upgrade_failed
+			return 1
+		}
+		remove_oem_ubi_volume ubi_rootfs
+		remove_oem_ubi_volume tp_data
+		sync || {
+			echo "failed to sync before flashing" >&2
+			nand_do_upgrade_failed
+			return 1
+		}
+		# Keep the boot index on the running slot until the write succeeds.
+		nand_do_flash_file "$1" || {
+			nand_do_upgrade_failed
+			return 1
+		}
+		sync || {
+			echo "failed to sync the inactive rootfs slot" >&2
+			nand_do_upgrade_failed
+			return 1
+		}
+		fw_setenv tp_boot_idx "$ax55_pro_upgrade_idx" || {
+			echo "failed to set tp_boot_idx $ax55_pro_upgrade_idx" >&2
+			nand_do_upgrade_failed
+			return 1
+		}
+		nand_do_upgrade_success
+		;;
 	tplink,archer-ax55-v1|\
 	tplink,eap650-outdoor-v1|\
 	tplink,re700x)

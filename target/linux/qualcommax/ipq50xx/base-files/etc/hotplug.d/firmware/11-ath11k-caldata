@@ -6,6 +6,21 @@
 
 board=$(board_name)
 
+ax55_pro_caldata() {
+	local label_mac
+
+	label_mac=$(get_mac_binary "/tmp/tp_data/default-mac" 0)
+	echo "$label_mac" | grep -Eq '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' || \
+		caldata_die "invalid or missing AX55 Pro factory MAC"
+	[ "$label_mac" != "00:00:00:00:00:00" ] && \
+		[ $((0x${label_mac%%:*} & 1)) -eq 0 ] || \
+		caldata_die "invalid AX55 Pro factory MAC"
+
+	caldata_extract "0:ART" "$1" 0x20000
+	ath11k_patch_mac "$(macaddr_add "$label_mac" "$2")" 0
+	ath11k_set_macflag
+}
+
 case "$FIRMWARE" in
 "ath11k/IPQ5018/hw1.0/cal-ahb-c000000.wifi.bin")
 	case "$board" in
@@ -68,7 +83,7 @@ case "$FIRMWARE" in
 		ath11k_set_macflag
 		;;
 	tplink,archer-ax55-pro-v1)
-		caldata_extract "0:ART" 0x1000 0x20000
+		ax55_pro_caldata 0x1000 -1
 		;;
 	tplink,archer-ax55-v1)
 		caldata_extract "0:ART" 0x1000 0x20000
@@ -160,7 +175,7 @@ case "$FIRMWARE" in
 		ath11k_set_macflag
 		;;
 	tplink,archer-ax55-pro-v1)
-		caldata_extract "0:ART" 0x26800 0x20000
+		ax55_pro_caldata 0x26800 -2
 		;;
 	tplink,archer-ax55-v1)
 		caldata_extract "0:ART" 0x26800 0x20000
